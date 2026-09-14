@@ -17,19 +17,35 @@ Part of the [bitcoin-blake](https://github.com/bitcoin-blake) family, next to
 2. **verify** the snapshot: parse the Core `dumptxoutset` v2 format and recompute
    `hash_serialized_3` over all coins, byte for byte as `gettxoutsetinfo` does. The result
    must equal the `txoutset_hash` pinned in `lib/params.mjs`.
-3. **sync**: fetch headers and blocks from a local Knots node over RPC, validate the header
-   chain (BLAKE2b v2 headers, testnet4 min-difficulty rule, MTP, timewarp), then run the
-   structural and contextual block rules against the UTXO set and apply each block.
-   At the end the coin count is cross-checked against the node's `gettxoutsetinfo`.
+3. **sync**: get every post-fork block, validate the header chain (BLAKE2b v2 headers,
+   testnet4 min-difficulty rule, MTP, timewarp), then run the structural and contextual
+   block rules against the UTXO set and apply each block. When a local Knots node is
+   reachable the coin count is cross-checked against its `gettxoutsetinfo`.
+
+   Blocks come from one of two sources (`--source`):
+   - **http** (default, no node needed): a served block file plus index, mirrored into the
+     data directory with Range requests so a re-run fetches only the tail. Every record is
+     checked against the index hash and linked to its parent. The newest NIP-333 header
+     event for the chain (kind 33333, `d` = `tbtc4b2`, from the pinned publisher key,
+     signature verified) is fetched from relays and its 12 headers must agree with the
+     file's tail, so the file cannot quietly serve a different chain. The epoch of headers
+     before the fork comes from a context file the same way.
+   - **rpc**: the local Knots node, as before.
+
+   The block file is kept current by `tools/export-blocks.mjs` from a node, appending new
+   blocks and unwinding reorgs; it is served at `https://melvin.me/datstr/snapshots/txbt4-blocks.{dat,json}`
+   by a datstr gateway's `--files` directory.
 
 ```
-node --max-old-space-size=8192 bin/blaketestnode.mjs bench            # fetch, verify, sync
+node --max-old-space-size=8192 bin/blaketestnode.mjs bench            # fetch, verify, sync: no node needed
 node bin/blaketestnode.mjs verify --data ./data                        # snapshot only
+node bin/blaketestnode.mjs sync --source rpc                           # blocks from the local node
 node bin/blaketestnode.mjs sync --no-scripts                           # skip signature checks
+node tools/export-blocks.mjs --loop 20                                 # keep the served block file current (needs a node)
 ```
 
-Options: `--data <dir>` (default `~/.blaketestnode/txbt4`), `--conf <bitcoin.conf>`,
-`--to <height>`, `--no-scripts`. The engine is loaded from `$SCHEMA` or
+Options: `--data <dir>` (default `~/.blaketestnode/txbt4`), `--source http|rpc`,
+`--conf <bitcoin.conf>`, `--to <height>`, `--no-scripts`. The engine is loaded from `$SCHEMA` or
 `~/bitcoin-desktop/schema`; it needs bitcoin-desktop/schema v0.0.27 or later (unified sighash, pay-to-anchor).
 
 ## Snapshot
@@ -49,10 +65,12 @@ Options: `--data <dir>` (default `~/.blaketestnode/txbt4`), `--conf <bitcoin.con
 | torrent fetch | 870 MB in 9.8 s, 85 MiB/s (webseed + one peer) |
 | sha256 of file | 1.8 s |
 | parse + hash_serialized_3 | 26 s, 545k coins/s, 3.5 GB RSS |
-| headers 150,308 to 151,070 | 763 validated, 0 failed, 148 ms |
+| block file, 2.4 MB, 766 blocks | 0.8 s fetch, 1.4 s with hash and link checks |
+| NIP-333 tip from relays | tip 151,073 verified, 12 tail hashes agree with the file |
+| headers 150,308 to 151,073 | 766 validated, 0 failed, 150 ms |
 | blocks, scripts off | 763 blocks, 5,045 txs, 2.5 s (300 blocks/s) |
 | blocks, scripts on | 51 s, 0 failures and no skipped rules on engine v0.0.27 (16 script failures on v0.0.25) |
-| UTXO count vs node | 14,233,495 both, match |
+| UTXO count vs node | 14,233,524 both, match (rpc cross-check when a node is reachable) |
 
 Post-fork transactions are signed with `SIGHASH_ALL | SIGHASH_UNIFIED` (0x21), the
 fork's replay protection. Engine v0.0.25 fails 16 blocks on that; from v0.0.26
@@ -66,5 +84,8 @@ validates with scripts on. Signature checks are about 48 of the 51 s, pure-JS se
 - `lib/snapshot.mjs` snapshot parser and `hash_serialized_3`
 - `lib/utxo.mjs` UTXO set: snapshot coins as byte offsets, decoded on read
 - `lib/fetch.mjs` WebTorrent fetch and sha256
+- `lib/blockfile.mjs`, `lib/source.mjs` the block file format and the http/rpc block sources
+- `lib/nip333.mjs` the chain tip from NIP-333 header events
+- `tools/export-blocks.mjs` keeps the served block file current from a node
 - `lib/engine.mjs`, `lib/rpc.mjs` engine and node RPC loaders
 - `bin/blaketestnode.mjs` the CLI

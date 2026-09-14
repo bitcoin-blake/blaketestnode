@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// blaketestnode: fetch | verify | sync | bench   (--data <dir>, --conf <bitcoin.conf>, --no-scripts, --to <height>)
+// blaketestnode: fetch | verify | sync | bench   (--data <dir>, --source http|rpc, --conf <bitcoin.conf>, --no-scripts, --to <height>)
 import { readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { CHAIN, SNAPSHOT } from '../lib/params.mjs';
@@ -8,6 +8,8 @@ import { UtxoSet } from '../lib/utxo.mjs';
 import { loadEngine } from '../lib/engine.mjs';
 import { makeRpc } from '../lib/rpc.mjs';
 import { fetchSnapshot, sha256File } from '../lib/fetch.mjs';
+import { HttpBlockSource, RpcBlockSource } from '../lib/source.mjs';
+import { fetchTip } from '../lib/nip333.mjs';
 
 const argv = process.argv.slice(2);
 const cmd = argv[0] ?? 'bench';
@@ -16,6 +18,7 @@ const DATA = opt('--data', `${homedir()}/.blaketestnode/${CHAIN.alias}`).replace
 const CONF = opt('--conf', CHAIN.conf);
 const NO_SCRIPTS = argv.includes('--no-scripts');
 const TO = opt('--to') ? Number(opt('--to')) : null;
+const SOURCE = opt('--source', 'http'); // http: the served block file + NIP-333 tip; rpc: the local node
 const log = (...a) => console.error(new Date().toISOString().slice(11, 19), ...a);
 const bench = {};
 const mb = () => (process.memoryUsage().rss / 1048576).toFixed(0) + ' MiB rss';
@@ -49,45 +52,83 @@ function load({ hash = true } = {}) {
 async function sync(utxo) {
   const k = await loadEngine(CHAIN.network);
   if (NO_SCRIPTS) k.blocks.interpreter = null;
-  const rpc = await makeRpc(CONF, CHAIN.network);
-  const tip = TO ?? await rpc('getblockcount');
+  const http = SOURCE !== 'rpc';
+  let rpc = null;
+  if (!http || existsSync(CONF.replace(/^~/, homedir()))) { try { rpc = await makeRpc(CONF, CHAIN.network); await rpc('getblockcount'); } catch { rpc = null; } }
+  if (!http && !rpc) throw new Error(`--source rpc needs a node at ${CONF}`);
+  const source = http ? new HttpBlockSource(k, CHAIN.blocksUrl, DATA, { log }) : new RpcBlockSource(rpc);
   const epochStart = Math.floor(SNAPSHOT.baseHeight / CHAIN.retargetInterval) * CHAIN.retargetInterval;
-  // headers: the whole current epoch up to the tip, decoded by the codec (v1 before the fork, v2 after)
-  let t0 = performance.now();
-  const headers = [], hashes = [];
-  for (let h = epochStart; h <= tip; h++) {
-    const hash = await rpc('getblockhash', h); hashes[h] = hash;
-    headers[h] = k.codec.decode('BlockHeader', await rpc('getblockheader', hash, false));
-  }
-  bench.headersFetch = { ms: +(performance.now() - t0).toFixed(0), count: tip - epochStart + 1 };
-  t0 = performance.now();
   const startHeight = SNAPSHOT.baseHeight + 1;
-  const verdicts = k.headers.validateChain(headers.slice(startHeight, tip + 1), { startHeight, prevContext: headers.slice(epochStart, startHeight), now: Math.floor(Date.now() / 1000) + 7200 });
+  let t0 = performance.now();
+
+  // the block file (mirrored with Range requests) and the NIP-333 tip as the independent check
+  let contextHeaders;
+  if (http) {
+    const u = await source.update();
+    bench.blockFile = { ...u, ms: +(performance.now() - t0).toFixed(0) };
+    log(`block file ${u.from}-${u.to}: ${u.fetched} bytes fetched, ${u.verified} blocks hash-checked`);
+    t0 = performance.now();
+    const nip = await fetchTip(k, CHAIN.nip333);
+    if (nip) {
+      bench.nip333 = { height: nip.height, hash: nip.hash, relay: nip.relay, ageS: Math.floor(Date.now() / 1000) - nip.created_at, ms: +(performance.now() - t0).toFixed(0) };
+      let checked = 0;
+      for (let i = 0; i < nip.headers.length; i++) {
+        const h = nip.first + i; const want = k.codec.blockHash(nip.headers[i]); const have = await source.hash(h);
+        if (have && have !== want) throw new Error(`block file disagrees with the NIP-333 headers at ${h}: ${have} vs ${want}`);
+        if (have) checked++;
+      }
+      bench.nip333.crossChecked = checked;
+      if (nip.height > u.to) log(`note: block file lags the nostr tip by ${nip.height - u.to} blocks`);
+      log(`nostr tip ${nip.height} ${nip.hash.slice(0, 16)}… from ${nip.relay}, ${bench.nip333.ageS} s old, ${checked} tail hashes agree with the block file`);
+    } else { bench.nip333 = null; log('no NIP-333 tip event reachable; trusting the block file alone'); }
+    t0 = performance.now();
+    const ctx = await source.contextHeaders(CHAIN.blocksUrl.replace(/-blocks$/, '-context-headers.json'));
+    if (ctx.from !== epochStart || ctx.to !== SNAPSHOT.baseHeight) throw new Error('context headers cover the wrong range');
+    contextHeaders = ctx.headers.map((h) => k.codec.decode('BlockHeader', h));
+  } else {
+    contextHeaders = [];
+    for (let h = epochStart; h <= SNAPSHOT.baseHeight; h++) contextHeaders.push(k.codec.decode('BlockHeader', await rpc('getblockheader', await rpc('getblockhash', h), false)));
+  }
+  const tip = TO ?? await source.tip();
+
+  // fetch + decode every post-fork block; the headers come out of the blocks
+  let fetchMs = 0, decodeMs = 0, bytes = 0;
+  const blocks = [], hashes = [];
+  for (let h = startHeight; h <= tip; h++) {
+    let t = performance.now();
+    const hex = await source.blockHex(h); fetchMs += performance.now() - t; bytes += hex.length / 2;
+    t = performance.now();
+    blocks[h] = k.codec.decode('Block', hex); decodeMs += performance.now() - t;
+    hashes[h] = await source.hash(h);
+  }
+  bench.headersFetch = { ms: +(performance.now() - t0).toFixed(0), count: tip - epochStart + 1, source: http ? 'block file' : 'rpc' };
+  t0 = performance.now();
+  const headers = blocks.slice(startHeight, tip + 1).map((b) => b.header);
+  const verdicts = k.headers.validateChain(headers, { startHeight, prevContext: contextHeaders, now: Math.floor(Date.now() / 1000) + 7200 });
   const badHeaders = verdicts.filter((v) => !v.ok);
   const nullHeaderRules = new Set(verdicts.flatMap((v) => v.results.filter((r) => r.ok === null).map((r) => r.rule)));
   bench.headers = { ms: +(performance.now() - t0).toFixed(0), validated: verdicts.length, failed: badHeaders.length, skippedRules: [...nullHeaderRules] };
   for (const v of badHeaders.slice(0, 3)) log('header failed', v.height, v.results.filter((r) => r.ok === false).map((r) => r.rule));
   for (let h = startHeight; h <= tip; h++) if (verdicts[h - startHeight].hash !== hashes[h]) throw new Error(`hash mismatch at ${h}: ${verdicts[h - startHeight].hash}`);
-  log(`headers: ${verdicts.length} validated, ${badHeaders.length} failed, hashes match the node, ${(performance.now() - t0).toFixed(0)} ms`);
+  log(`headers: ${verdicts.length} validated, ${badHeaders.length} failed, hashes match the source, ${(performance.now() - t0).toFixed(0)} ms`);
 
-  // blocks: fetch, decode, structural rules, contextual rules against the UTXO set, apply
+  // structural rules, contextual rules against the UTXO set, apply
+  const all = [...contextHeaders, ...headers]; // for MTP windows
   const rulesNull = new Map(), rulesFailed = new Map();
-  let txs = 0, bytes = 0, fetchMs = 0, decodeMs = 0, validateMs = 0, applyMs = 0, created = 0, spent = 0, failed = 0;
+  let txs = 0, validateMs = 0, applyMs = 0, created = 0, spent = 0, failed = 0;
   const tAll = performance.now();
   for (let h = startHeight; h <= tip; h++) {
-    let t = performance.now();
-    const hex = await rpc('getblock', hashes[h], 0); fetchMs += performance.now() - t; bytes += hex.length / 2;
-    t = performance.now();
-    const block = k.codec.decode('Block', hex); decodeMs += performance.now() - t;
+    const block = blocks[h];
     txs += block.transactions.length;
-    t = performance.now();
+    let t = performance.now();
     const s = k.blocks.validateBlockStructure(block);
-    const mtp = k.headers.medianTimePast(headers.slice(h - 11, h));
+    const i = h - epochStart;
+    const mtp = k.headers.medianTimePast(all.slice(i - 11, i));
     const c = k.blocks.validateBlockContext(block, { height: h, utxo, mtp });
     validateMs += performance.now() - t;
     for (const r of [...s.results, ...c.results]) {
       if (r.ok === null) rulesNull.set(r.rule, (rulesNull.get(r.rule) ?? 0) + 1);
-      if (r.ok === false) { rulesFailed.set(r.rule, (rulesFailed.get(r.rule) ?? 0) + 1); }
+      if (r.ok === false) rulesFailed.set(r.rule, (rulesFailed.get(r.rule) ?? 0) + 1);
     }
     if (!s.ok || !c.ok) { failed++; if (failed <= 5) log(`block ${h} failed:`, [...s.results, ...c.results].filter((r) => r.ok === false).map((r) => r.rule).join(', '), c.spending.missing.slice(0, 2)); }
     t = performance.now();
@@ -95,12 +136,16 @@ async function sync(utxo) {
     if ((h - startHeight) % 200 === 199) log(`  block ${h}, ${txs} txs, ${mb()}`);
   }
   const ms = performance.now() - tAll;
-  bench.blocks = { from: startHeight, to: tip, count: tip - startHeight + 1, txs, MiB: +(bytes / 1048576).toFixed(1), ms: +ms.toFixed(0), blocksPerSec: +((tip - startHeight + 1) / (ms / 1000)).toFixed(1), fetchMs: +fetchMs.toFixed(0), decodeMs: +decodeMs.toFixed(0), validateMs: +validateMs.toFixed(0), applyMs: +applyMs.toFixed(0), failed, created, spent, utxoSize: utxo.size, skippedRules: Object.fromEntries(rulesNull), failedRules: Object.fromEntries(rulesFailed), scripts: !NO_SCRIPTS, rss: mb() };
+  bench.blocks = { from: startHeight, to: tip, count: tip - startHeight + 1, txs, MiB: +(bytes / 1048576).toFixed(1), ms: +ms.toFixed(0), blocksPerSec: +((tip - startHeight + 1) / (ms / 1000)).toFixed(1), fetchMs: +fetchMs.toFixed(0), decodeMs: +decodeMs.toFixed(0), validateMs: +validateMs.toFixed(0), applyMs: +applyMs.toFixed(0), failed, created, spent, utxoSize: utxo.size, skippedRules: Object.fromEntries(rulesNull), failedRules: Object.fromEntries(rulesFailed), scripts: !NO_SCRIPTS, source: http ? 'http' : 'rpc', rss: mb() };
   log(`blocks: ${bench.blocks.count} validated to ${tip}, ${failed} failed, ${txs} txs, ${(ms / 1000).toFixed(1)} s`);
-  // cross-check the resulting set against the node
-  const info = await rpc('gettxoutsetinfo', 'none', TO ?? undefined);
-  bench.crosscheck = { nodeCoins: info.txouts, ourCoins: utxo.size, match: info.txouts === utxo.size, height: info.height };
-  log(`utxo count: ours ${utxo.size.toLocaleString()} vs node ${info.txouts.toLocaleString()} at ${info.height} → ${bench.crosscheck.match ? 'match' : 'MISMATCH'}`);
+  // cross-check the resulting set against a node when one is reachable
+  if (rpc) {
+    try {
+      const info = await rpc('gettxoutsetinfo', 'none', TO ?? undefined);
+      bench.crosscheck = { nodeCoins: info.txouts, ourCoins: utxo.size, match: info.txouts === utxo.size, height: info.height };
+      log(`utxo count: ours ${utxo.size.toLocaleString()} vs node ${info.txouts.toLocaleString()} at ${info.height} → ${bench.crosscheck.match ? 'match' : 'MISMATCH'}`);
+    } catch (e) { bench.crosscheck = { ourCoins: utxo.size, note: e.message }; }
+  } else { bench.crosscheck = { ourCoins: utxo.size, node: 'none' }; log(`utxo count: ${utxo.size.toLocaleString()} coins at ${tip} (no node to compare with)`); }
 }
 
 try {
