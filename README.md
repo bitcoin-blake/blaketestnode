@@ -30,8 +30,7 @@ node bin/blaketestnode.mjs sync --no-scripts                           # skip si
 
 Options: `--data <dir>` (default `~/.blaketestnode/txbt4`), `--conf <bitcoin.conf>`,
 `--to <height>`, `--no-scripts`. The engine is loaded from `$SCHEMA` or
-`~/bitcoin-desktop/schema`; it needs bitcoin-desktop/schema v0.0.26 or later (the unified
-sighash).
+`~/bitcoin-desktop/schema`; it needs bitcoin-desktop/schema v0.0.27 or later (unified sighash, pay-to-anchor).
 
 ## Snapshot
 
@@ -52,7 +51,7 @@ sighash).
 | parse + hash_serialized_3 | 26 s, 545k coins/s, 3.5 GB RSS |
 | headers 150,308 to 151,070 | 763 validated, 0 failed, 148 ms |
 | blocks, scripts off | 763 blocks, 5,045 txs, 2.5 s (300 blocks/s) |
-| blocks, scripts on | 51 s, 0 failures on engine v0.0.26 (16 script failures on v0.0.25) |
+| blocks, scripts on | 51 s, 0 failures and no skipped rules on engine v0.0.27 (16 script failures on v0.0.25) |
 | UTXO count vs node | 14,233,495 both, match |
 
 Post-fork transactions are signed with `SIGHASH_ALL | SIGHASH_UNIFIED` (0x21), the
