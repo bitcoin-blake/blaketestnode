@@ -29,12 +29,21 @@ const post = (m) => self.postMessage(m);
 const log = (text) => post({ type: 'log', text });
 let root;
 const dir = async () => (root ??= await navigator.storage.getDirectory());
-async function open(name, create = false) { const fh = await (await dir()).getFileHandle(name, { create }); return fh.createSyncAccessHandle(); }
-async function sizeOf(name) { if (name === SNAPSHOT.file && chain.snap) return chain.snap.getSize(); try { const h = await open(name); const n = h.getSize(); h.close(); return n; } catch { return -1; } }
+// a handle on a file. Right after a reload the previous page's worker may still hold one for a
+// moment, so wait a little before concluding another tab of this origin has the files open.
+async function open(name, create = false) {
+  const fh = await (await dir()).getFileHandle(name, { create });
+  for (let attempt = 0; ; attempt++) {
+    try { return await fh.createSyncAccessHandle(); }
+    catch (e) { if (attempt >= 24 || !/Access Handle/.test(e.message)) throw new Error(attempt >= 24 ? `${name} is open in another tab of this site; close it and retry` : e.message); await new Promise((r) => setTimeout(r, 250)); }
+  }
+}
+async function sizeOf(name) { try { const h = await open(name); const n = h.getSize(); h.close(); return n; } catch { return -1; } }
 
 // { size, read(off, len) } over an OPFS sync access handle: the browser twin of FileBytes
 class OpfsBytes {
-  constructor(handle) { this.h = handle; this.size = handle.getSize(); }
+  constructor(handle) { this.h = handle; this.size = handle?.getSize() ?? 0; }
+  attach(handle) { this.h = handle; this.size = handle.getSize(); }
   read(off, len) { const b = new Uint8Array(Math.min(len, Math.max(0, this.size - off))); const n = this.h.read(b, { at: off }); return n === b.length ? b : b.subarray(0, n); }
 }
 
@@ -113,14 +122,21 @@ async function verify() {
 async function wipe() { const d = await dir(); for (const n of [SNAPSHOT.file, `${SNAPSHOT.file}.idx`, `${SNAPSHOT.file}.sha256`, `${SNAPSHOT.file}.ranges`]) { try { await d.removeEntry(n); } catch {} } }
 
 // ---- the chain: blocks from the served file, tip from the relays, validation against the set ----
-const chain = { node: null, utxo: null, source: null, snap: null, nostr: null, deltas: [], syncing: false, timer: null, blocksUrl: null };
+const chain = { node: null, utxo: null, source: null, bytes: null, nostr: null, deltas: [], syncing: false, timer: null, blocksUrl: null };
 async function loadSet() {
   if (chain.utxo) return chain.utxo;
   const ih = await open(`${SNAPSHOT.file}.idx`); const ib = new Uint8Array(ih.getSize()); ih.read(ib, { at: 0 }); ih.close();
   const index = parseIndexBytes(ib, SNAPSHOT.sha256);
-  chain.snap = await open(SNAPSHOT.file);
-  chain.utxo = new PackedUtxo(new OpfsBytes(chain.snap), index);
+  chain.bytes = new OpfsBytes(null);
+  chain.utxo = new PackedUtxo(chain.bytes, index);
   return chain.utxo;
+}
+// the snapshot handle is held only while a job runs, so a page on its way out never blocks
+// the next one for long
+async function withSnapshot(fn) {
+  await loadSet();
+  const h = await open(SNAPSHOT.file); chain.bytes.attach(h);
+  try { return await fn(); } finally { h.close(); chain.bytes.h = null; }
 }
 async function sync(blocksUrl, { noScripts = false } = {}) {
   if (chain.syncing) return; chain.syncing = true;
@@ -145,7 +161,7 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
       let replayed = 0;
       for (const d of chain.deltas) {
         if (d.height !== chain.node.height + 1 || (await chain.source.hash(d.height)) !== d.hash) { chain.deltas.length = replayed; break; }
-        for (const key of d.spent) utxo.delete(key); for (const [key, coin] of d.created) utxo.set(key, coin);
+        for (const key of d.spent) utxo.delete(key); for (const [key, coin] of d.created) if (coin) utxo.set(key, coin);
         const b = k.codec.decode('Block', await chain.source.blockHex(d.height)); chain.node.headers[d.height] = b.header; chain.node.chain[d.height] = d.hash; chain.node.height = d.height; replayed++;
       }
       if (replayed) log(`replayed ${replayed} blocks from this tab's delta log`);
@@ -165,15 +181,16 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     let applied = 0, txs = 0;
     for (let h = chain.node.height + 1; h <= to; h++) {
       const r = chain.node.applyNext(h, await chain.source.blockHex(h));
-      const uu = chain.node.undo.at(-1); chain.deltas.push({ height: h, hash: r.hash, spent: uu.spent.map(([key]) => key), created: uu.created.map((key) => [key, utxo.get(key)]) });
+      // a coin created and spent within the block is gone already and must not be replayed back
+      const uu = chain.node.undo.at(-1); chain.deltas.push({ height: h, hash: r.hash, spent: uu.spent.map(([key]) => key), created: uu.created.map((key) => [key, utxo.get(key)]).filter(([, c]) => c) });
       applied++; txs += r.txs;
       if (applied % 20 === 0 || h === to) post({ type: 'progress', height: h, to, applied, txs, ms: performance.now() - t0, coins: utxo.size });
     }
     if (applied) await writeSmall('deltas.json', JSON.stringify(chain.deltas));
-    post({ type: 'synced', height: chain.node.height, hash: chain.node.tipHash(), time: chain.node.headers[chain.node.height]?.time ?? null, coins: utxo.size, applied, txs, ms: performance.now() - t0, stats: chain.node.stats, scripts: !noScripts });
+    post({ type: 'synced', height: chain.node.height, hash: chain.node.tipHash(), time: chain.node.headers[chain.node.height]?.time ?? null, coins: utxo.size, applied, txs, ms: performance.now() - t0, stats: chain.node.stats, scripts: !noScripts, quiet: applied === 0 && !!chain.timer });
     if (!chain.timer) {
-      chain.timer = setInterval(() => sync(chain.blocksUrl, { noScripts }).catch((e) => post({ type: 'error', text: e.message })), 30_000);
-      subscribeTip(k, CHAIN.nip333, (t) => { chain.nostr = { ...t, agree: chain.node.chain[t.height] ? 1 : 0 }; post({ type: 'nostr', ...chain.nostr, live: true }); if (t.height > chain.node.height) setTimeout(() => sync(chain.blocksUrl, { noScripts }).catch(() => {}), 3000); }, { nostr, log });
+      chain.timer = setInterval(() => enqueue(() => withSnapshot(() => sync(chain.blocksUrl, { noScripts }))), 30_000);
+      subscribeTip(k, CHAIN.nip333, (t) => { chain.nostr = { ...t, agree: chain.node.chain[t.height] ? 1 : 0 }; post({ type: 'nostr', ...chain.nostr, live: true }); if (t.height > chain.node.height) setTimeout(() => enqueue(() => withSnapshot(() => sync(chain.blocksUrl, { noScripts }))), 3000); }, { nostr, log });
     }
   } finally { chain.syncing = false; }
 }
@@ -185,20 +202,25 @@ async function coin(key) {
   post({ type: 'coin', key, found: true, value: c.output.value, height: c.height, coinbase: c.coinbase, scriptType: cl.type, address: cl.address, scriptPubKey: c.output.scriptPubKey });
 }
 
-self.onmessage = async (e) => {
-  const m = e.data;
+// one job at a time: every job opens OPFS handles, and two jobs interleaving at an await
+// would try to open the same file twice
+let queue = Promise.resolve();
+const enqueue = (fn) => (queue = queue.then(fn).catch((err) => post({ type: 'error', text: err.message })));
+self.onmessage = (e) => enqueue(() => handle(e.data));
+async function handle(m) {
   try {
-    if (m.type === 'sync') await sync(m.blocksUrl, { noScripts: !!m.noScripts });
-    else if (m.type === 'debug') {
+    if (m.type === 'sync') await withSnapshot(() => sync(m.blocksUrl, { noScripts: !!m.noScripts }));
+    else if (m.type === 'close') { if (chain.timer) { clearInterval(chain.timer); chain.timer = null; } }
+    else if (m.type === 'debug') await withSnapshot(async () => {
       const u = chain.utxo; const c = u?.get(m.key) ?? null; let cl = null, err = null;
       try { cl = engine?.k?.script ? engine.k.script.classify(c.output.scriptPubKey) : 'no k.script: ' + Object.keys(engine?.k ?? {}).join(','); } catch (e) { err = e.message + ' ' + (e.stack ?? '').split('\n').slice(0, 3).join(' / '); }
       post({ type: 'debug', key: m.key, hasUtxo: !!u, fresh: u?.fresh.size, freshHas: u?.fresh.has(m.key), get: c, classify: cl, err, height: chain.node?.height, deltas: chain.deltas.length });
-    }
-    else if (m.type === 'coin') await coin(m.key);
+    });
+    else if (m.type === 'coin') await withSnapshot(() => coin(m.key));
     else if (m.type === 'status') await status();
     else if (m.type === 'fetch') { await fetchSnapshot(m.url); await status(); }
     else if (m.type === 'hash') { const hex = await hashFile(); post({ type: 'fetched', bytes: await sizeOf(SNAPSHOT.file), ms: 0, sha256: hex, ok: hex === SNAPSHOT.sha256 }); await status(); }
     else if (m.type === 'verify') { await verify(); await status(); }
     else if (m.type === 'wipe') { await wipe(); await status(); }
-  } catch (err) { post({ type: 'error', text: err.message }); }
-};
+  } catch (err) { post({ type: 'error', text: err.message + (err.stack ? ' @ ' + err.stack.split('\n').slice(1, 4).map((l) => l.trim()).join(' < ') : '') }); }
+}

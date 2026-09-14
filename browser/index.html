@@ -26,13 +26,13 @@
   <div class="card"><div class="k">storage</div><div class="v" id="storage">…</div><div class="s" id="storages"></div></div>
   <div class="card"><div class="k">snapshot on disk</div><div class="v" id="dat">…</div><progress id="fetchbar" max="100" value="0" hidden></progress><div class="s" id="dats"></div></div>
   <div class="card"><div class="k">verification</div><div class="v" id="ver">…</div><div class="s" id="vers"></div></div>
-  <div class="card"><div class="k">index</div><div class="v" id="idx">…</div><div class="s" id="idxs"></div><div class="s">coins now: <span id="coins">…</span></div></div>
+  <div class="card"><div class="k">index</div><div class="v" id="idx">…</div><div class="s" id="idxs"></div></div>
   <div class="card">
     <div class="k">blocks source</div>
     <input id="blocks" placeholder="https://…/txbt4-blocks (the served block file, without .dat/.json; ?blocks= sets it)">
     <div><button id="sync" class="primary">sync to the tip</button> <label class="s"><input type="checkbox" id="noscripts" style="width:auto;margin:0 4px 0 0">skip signature checks</label></div>
   </div>
-  <div class="card" id="tipcard"><div class="k">height</div><div class="v" id="height">…</div><div class="s" id="hash"></div><div class="s" id="age"></div></div>
+  <div class="card" id="tipcard"><div class="k">height</div><div class="v" id="height">…</div><div class="s" id="hash"></div><div class="s" id="age"></div><div class="s"><span id="coins">…</span> coins in the set · <span id="checked"></span></div></div>
   <div class="card"><div class="k">nostr tip (NIP-333)</div><div class="v" id="nostr">…</div><div class="s" id="nostrs"></div></div>
   <div class="card"><div class="k">block file</div><div class="v" id="file">…</div><div class="s" id="files"></div></div>
   <div class="card"><div class="k">validation</div><div class="v" id="val">…</div><progress id="valbar" max="100" value="0" hidden></progress><div class="s" id="vals"></div></div>
@@ -62,7 +62,7 @@ worker.onmessage = (e) => {
   else if (m.type === 'blockfile') { $('file').textContent = `${m.from.toLocaleString()} – ${m.to.toLocaleString()}`; $('files').textContent = `${m.blocks} blocks · ${m.fetched} bytes fetched · ${m.verified} records checked`; }
   else if (m.type === 'nostr') { $('nostr').textContent = m.height.toLocaleString(); $('nostr').className = 'v ok'; $('nostrs').textContent = `${m.hash.slice(0, 16)}… · ${m.relay} · event ${ago(now() - m.created_at)} · ${m.agree} tail hashes agree with the file${m.live ? ' · live' : ''}`; }
   else if (m.type === 'progress') { $('valbar').hidden = false; $('valbar').value = m.applied / Math.max(1, m.to - (m.height - m.applied)) * 100; $('val').textContent = `block ${m.height.toLocaleString()} of ${m.to.toLocaleString()}`; $('vals').textContent = `${m.applied} blocks, ${m.txs} txs, ${(m.ms / 1000).toFixed(1)} s`; $('height').textContent = m.height.toLocaleString(); $('coins').textContent = m.coins.toLocaleString(); }
-  else if (m.type === 'synced') { $('valbar').hidden = true; $('val').textContent = 'synced'; $('val').className = 'v ok'; $('vals').textContent = `${m.applied} blocks applied this pass, ${m.txs} txs, ${(m.ms / 1000).toFixed(1)} s${m.scripts ? ', signatures checked' : ', signatures skipped'} · ${m.stats.failed} failed`; $('height').textContent = m.height.toLocaleString(); $('hash').textContent = m.hash; $('age').textContent = m.time ? `block time ${new Date(m.time * 1000).toISOString().slice(0, 19).replace('T', ' ')} UTC · ${ago(now() - m.time)}` : ''; $('coins').textContent = m.coins.toLocaleString(); log(`synced to ${m.height.toLocaleString()}: ${m.applied} blocks in ${(m.ms / 1000).toFixed(1)} s`); busy = false; buttons(); }
+  else if (m.type === 'synced') { $('valbar').hidden = true; $('val').textContent = 'synced'; $('val').className = 'v ok'; $('vals').textContent = `${m.applied} blocks applied this pass, ${m.txs} txs, ${(m.ms / 1000).toFixed(1)} s${m.scripts ? ', signatures checked' : ', signatures skipped'} · ${m.stats.failed} failed`; $('height').textContent = m.height.toLocaleString(); $('hash').textContent = m.hash; $('age').textContent = m.time ? `block time ${new Date(m.time * 1000).toISOString().slice(0, 19).replace('T', ' ')} UTC · ${ago(now() - m.time)}` : ''; $('coins').textContent = m.coins.toLocaleString(); if (!m.quiet) log(`synced to ${m.height.toLocaleString()}: ${m.applied} blocks in ${(m.ms / 1000).toFixed(1)} s`); $('checked').textContent = `checked ${new Date().toISOString().slice(11, 19)} UTC`; busy = false; buttons(); }
   else if (m.type === 'coin') $('coin').textContent = m.found ? `${m.value.toLocaleString()} sats · ${m.scriptType} ${m.address ?? ''} · created at ${m.height.toLocaleString()}${m.coinbase ? ' (coinbase)' : ''}` : 'not in the set';
   else if (m.type === 'verified') log(`verified in ${(m.ms / 1000).toFixed(1)} s: ${m.coins.toLocaleString()} coins in ${m.txids.toLocaleString()} txids, hash_serialized_3 ${m.hashSerialized.slice(0, 16)}… ${m.ok ? 'matches' : 'MISMATCH'}; index ${mib(m.indexBytes)}`);
 };
@@ -88,5 +88,6 @@ $('verify').onclick = () => { busy = true; buttons(); log('verifying'); worker.p
 $('wipe').onclick = () => { busy = true; buttons(); worker.postMessage({ type: 'wipe' }); };
 worker.onmessage = ((inner) => (e) => { inner(e); if (e.data.type === 'fetched' && e.data.ok) { log('verifying'); worker.postMessage({ type: 'verify' }); } })(worker.onmessage);
 window.__worker = worker; // for debugging from the console
+addEventListener('pagehide', () => worker.postMessage({ type: 'close' }));
 worker.postMessage({ type: 'status' });
 </script>

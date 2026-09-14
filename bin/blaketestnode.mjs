@@ -244,7 +244,7 @@ async function run() {
       if (to > node.height) st.state = 'syncing';
       for (let h = node.height + 1; h <= to; h++) {
         const r = node.applyNext(h, await source.blockHex(h));
-        const u = node.undo.at(-1); deltas.append({ height: h, hash: r.hash, spent: u.spent.map(([key]) => key), created: u.created.map((key) => [key, utxo.get(key)]) });
+        const u = node.undo.at(-1); deltas.append({ height: h, hash: r.hash, spent: u.spent.map(([key]) => key), created: u.created.map((key) => [key, utxo.get(key)]).filter(([, c]) => c) }); // a coin spent in its own block is gone already
         st.tipTime = r.time; sinceSave++; dirty = false;
         api?.broadcast({ type: 'block', height: h, hash: r.hash, txs: r.txs, time: r.time });
         if (h % 50 === 0 || h === to) log(`block ${h} ${r.hash.slice(0, 16)}… ${r.txs} txs${h === to ? ' (tip)' : ''}`);
