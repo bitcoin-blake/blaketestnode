@@ -3,8 +3,8 @@
 import { readFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { CHAIN, SNAPSHOT } from '../lib/params.mjs';
-import { parseSnapshot } from '../lib/snapshot.mjs';
-import { UtxoSet } from '../lib/utxo.mjs';
+import { parseSnapshot, writeSnapshot } from '../lib/snapshot.mjs';
+import { PackedUtxo, FileBytes, buildIndex, writeIndex, readIndex } from '../lib/packed.mjs';
 import { loadEngine } from '../lib/engine.mjs';
 import { makeRpc } from '../lib/rpc.mjs';
 import { fetchSnapshot, sha256File } from '../lib/fetch.mjs';
@@ -13,6 +13,7 @@ import { fetchTip, subscribeTip } from '../lib/nip333.mjs';
 import { ChainNode } from '../lib/node.mjs';
 import { listStates, saveState } from '../lib/state.mjs';
 import { startApi } from '../lib/api.mjs';
+import { DeltaLog, applyDelta } from '../lib/delta.mjs';
 
 const argv = process.argv.slice(2);
 const cmd = argv[0] ?? 'bench';
@@ -24,7 +25,7 @@ const TO = opt('--to') ? Number(opt('--to')) : null;
 const SOURCE = opt('--source', 'http'); // http: a served block file + NIP-333 tip; rpc: the local node
 if (opt('--blocks-url')) CHAIN.blocksUrl = opt('--blocks-url');
 if (opt('--webseed')) SNAPSHOT.webseed = opt('--webseed');
-const API = Number(opt('--api', 3336)); const POLL = Number(opt('--poll', 30)); const CKPT = Number(opt('--checkpoint-every', 100));
+const API = Number(opt('--api', 3337)); const POLL = Number(opt('--poll', 30)); const CKPT = Number(opt('--checkpoint-every', 2016));
 const log = (...a) => console.error(new Date().toISOString().slice(11, 19), ...a);
 const bench = {};
 const mb = () => (process.memoryUsage().rss / 1048576).toFixed(0) + ' MiB rss';
@@ -39,19 +40,35 @@ async function fetch() {
   log('sha256 ok');
 }
 
-function load({ hash = true } = {}) {
-  if (!existsSync(snapPath)) throw new Error(`no snapshot at ${snapPath}; run fetch first`);
-  let t0 = performance.now();
-  const buf = readFileSync(snapPath);
-  bench.read = { ms: +(performance.now() - t0).toFixed(0), bytes: buf.length };
-  const utxo = new UtxoSet(buf);
-  t0 = performance.now();
-  const r = parseSnapshot(buf, { hash, log, onCoin: (txid, vout, off) => utxo.addSnapshotCoin(txid, vout, off) });
-  bench.parse = { ms: +r.ms.toFixed(0), coins: r.coinsRead, txids: r.txids, coinsPerSec: Math.round(r.coinsRead / (r.ms / 1000)), rss: mb() };
-  const checks = { magic: true, network: r.networkMagic === CHAIN.networkMagic, baseHash: r.baseHash === SNAPSHOT.baseHash, coins: r.coinsRead === SNAPSHOT.coins, hashSerialized: hash ? r.hashSerialized === SNAPSHOT.txoutsetHash : null };
-  bench.snapshot = { ...checks, baseHash: r.baseHash, hashSerialized: r.hashSerialized };
-  if (Object.values(checks).includes(false)) throw new Error(`snapshot check failed: ${JSON.stringify(checks)} got ${r.hashSerialized}`);
-  log(`snapshot ok: ${r.coinsRead.toLocaleString()} coins in ${r.txids.toLocaleString()} txids, hash_serialized_3 matches, ${(r.ms / 1000).toFixed(1)} s, ${mb()}`);
+// The UTXO set from a snapshot file: its packed index is built once (a full parse that also
+// recomputes hash_serialized_3) and read back on every later start.
+function load({ path = snapPath, sha256 = SNAPSHOT.sha256, expect = SNAPSHOT } = {}) {
+  if (!existsSync(path)) throw new Error(`no snapshot at ${path}; run fetch first`);
+  const idxPath = `${path}.idx`;
+  let index;
+  if (existsSync(idxPath)) {
+    const t0 = performance.now();
+    try { index = readIndex(idxPath, sha256); bench.index = { ms: +(performance.now() - t0).toFixed(0), coins: index.count, from: 'file' }; log(`index read: ${index.count.toLocaleString()} coins in ${bench.index.ms} ms`); }
+    catch (e) { log(`index unusable (${e.message}), rebuilding`); index = null; }
+  }
+  if (!index) {
+    let t0 = performance.now();
+    const buf = readFileSync(path);
+    bench.read = { ms: +(performance.now() - t0).toFixed(0), bytes: buf.length };
+    t0 = performance.now();
+    const r = parseSnapshot(buf, { hash: true, log });
+    bench.parse = { ms: +r.ms.toFixed(0), coins: r.coinsRead, txids: r.txids, coinsPerSec: Math.round(r.coinsRead / (r.ms / 1000)), rss: mb() };
+    const checks = { magic: true, network: r.networkMagic === CHAIN.networkMagic, baseHash: r.baseHash === (expect.baseHash ?? expect.base_hash), coins: r.coinsRead === expect.coins, hashSerialized: r.hashSerialized === (expect.txoutsetHash ?? expect.txoutset_hash) };
+    bench.snapshot = { ...checks, baseHash: r.baseHash, hashSerialized: r.hashSerialized };
+    if (Object.values(checks).includes(false)) throw new Error(`snapshot check failed: ${JSON.stringify(checks)} got ${r.hashSerialized}`);
+    log(`snapshot ok: ${r.coinsRead.toLocaleString()} coins in ${r.txids.toLocaleString()} txids, hash_serialized_3 matches, ${(r.ms / 1000).toFixed(1)} s`);
+    t0 = performance.now();
+    const built = buildIndex(buf); writeIndex(idxPath, built, sha256); index = { entries: built.entries, count: built.count };
+    bench.index = { ms: +(performance.now() - t0).toFixed(0), coins: built.count, from: 'built', bytes: built.entries.length };
+    log(`index built: ${built.count.toLocaleString()} entries, ${(built.entries.length / 1048576).toFixed(0)} MiB, ${bench.index.ms} ms, ${mb()}`);
+  }
+  const utxo = new PackedUtxo(new FileBytes(path), index);
+  log(`utxo set: ${utxo.size.toLocaleString()} coins, ${mb()}`);
   return utxo;
 }
 
@@ -167,7 +184,7 @@ async function run() {
   const st = { state: 'starting', nostr: null, file: null, checkpoint: null, saving: false, lastTickAt: null, rollbacks: 0, startedFrom: null, tipTime: null };
   let node = null, utxo = null, api = null;
   const status = () => ({ network: CHAIN.network, alias: CHAIN.alias, height: node?.height ?? -1, hash: node?.tipHash() ?? null, tipTime: st.tipTime, coins: utxo?.size ?? 0, state: st.state, saving: st.saving,
-    checkpoint: st.checkpoint, nostr: st.nostr, file: st.file, lastTickAt: st.lastTickAt, uptimeS: Math.floor((Date.now() - startedAt) / 1000), rssMiB: Math.round(process.memoryUsage().rss / 1048576),
+    checkpoint: st.checkpoint, deltas: node ? deltas?.length ?? 0 : 0, nostr: st.nostr, file: st.file, lastTickAt: st.lastTickAt, uptimeS: Math.floor((Date.now() - startedAt) / 1000), rssMiB: Math.round(process.memoryUsage().rss / 1048576),
     run: node ? { blocks: node.stats.blocks, txs: node.stats.txs, validateMs: Math.round(node.stats.validateMs), failed: node.stats.failed, rollbacks: st.rollbacks, startedFrom: st.startedFrom, skipped: node.stats.skipped } : { blocks: 0, txs: 0, validateMs: 0, failed: 0, rollbacks: 0, startedFrom: st.startedFrom } });
   api = await startApi({ port: API, status, node: () => node, source, k, log }); // before the long load, so a port clash fails fast
   let file = await source.update(); st.file = { ...file, blocks: source.index.blocks.length, at: Math.floor(Date.now() / 1000) };
@@ -179,13 +196,19 @@ async function run() {
   for (const m of listStates(DATA)) {
     if (m.base_height > source.index.to || (await source.hash(m.base_height)) !== m.base_hash) { log(`checkpoint ${m.base_height} is not on the served chain, skipping`); continue; }
     log(`loading checkpoint ${m.base_height} ${m.base_hash.slice(0, 16)}…`);
-    const buf = readFileSync(m.path); utxo = new UtxoSet(buf);
-    const r = parseSnapshot(buf, { log, onCoin: (txid, vout, off) => utxo.addSnapshotCoin(txid, vout, off) });
-    if (r.baseHash !== m.base_hash || r.hashSerialized !== m.txoutset_hash || r.coinsRead !== m.coins) { log('checkpoint corrupt, skipping'); utxo = null; continue; }
+    try { utxo = load({ path: m.path, sha256: m.sha256, expect: m }); } catch (e) { log(`checkpoint unusable (${e.message}), skipping`); utxo = null; continue; }
     base = { height: m.base_height, hash: m.base_hash }; st.checkpoint = { height: m.base_height, hash: m.base_hash, bytes: m.bytes }; break;
   }
   if (!utxo) { utxo = load(); base = { height: SNAPSHOT.baseHeight, hash: SNAPSHOT.baseHash }; }
   st.startedFrom = `${base.height}`;
+  // deltas since that base: our own record of every block applied, replayed in seconds
+  const deltas = new DeltaLog(`${DATA}/deltas.jsonl`);
+  let replayed = 0;
+  for (const d of deltas.entries(base.height)) {
+    if (d.height !== base.height + 1 || (await source.hash(d.height)) !== d.hash) { log(`delta ${d.height} does not follow the served chain, dropping it and the rest`); deltas.truncate(d.height - 1); break; }
+    applyDelta(utxo, d); base = { height: d.height, hash: d.hash }; replayed++;
+  }
+  if (replayed) log(`replayed ${replayed} delta(s) to ${base.height}`);
   node = new ChainNode({ k, utxo, epochStart, log });
   node.loadContext(ctx.headers.map((h) => k.codec.decode('BlockHeader', h)));
   node.setBase(base.height, base.hash);
@@ -200,7 +223,7 @@ async function run() {
     st.saving = true; const t0 = performance.now();
     try {
       const m = await saveState(DATA, utxo, { height: node.height, hash: node.tipHash(), networkMagic: magic, network: CHAIN.network, log });
-      st.checkpoint = { height: m.base_height, hash: m.base_hash, bytes: m.bytes, txoutset_hash: m.txoutset_hash }; sinceSave = 0; dirty = false;
+      st.checkpoint = { height: m.base_height, hash: m.base_hash, bytes: m.bytes, txoutset_hash: m.txoutset_hash }; sinceSave = 0; dirty = false; deltas.compact(m.base_height);
       log(`checkpoint ${m.base_height} written (${reason}): ${m.coins.toLocaleString()} coins, ${(m.bytes / 1048576).toFixed(0)} MiB, hash_serialized_3 ${m.txoutset_hash.slice(0, 16)}…, ${((performance.now() - t0) / 1000).toFixed(1)} s`);
     } catch (e) { log('checkpoint failed:', e.message); } finally { st.saving = false; }
   }
@@ -214,20 +237,21 @@ async function run() {
       while (common > SNAPSHOT.baseHeight && (await source.hash(common)) !== node.chain[common]) common--;
       if (common < node.height) {
         log(`reorg: served chain diverges above ${common}, rolling back ${node.height - common} block(s)`);
-        try { node.rollbackTo(common); st.rollbacks += node.height - common; dirty = true; }
+        try { const from = node.height; node.rollbackTo(common); deltas.truncate(common); st.rollbacks += from - common; }
         catch (e) { log(`${e.message}; discarding checkpoints above ${common} and restarting`); for (const m of listStates(DATA)) if (m.base_height > common) { unlinkSync(m.path); unlinkSync(m.path.replace(/\.dat$/, '.json')); } process.exit(3); }
       }
       const to = source.index.to;
       if (to > node.height) st.state = 'syncing';
       for (let h = node.height + 1; h <= to; h++) {
         const r = node.applyNext(h, await source.blockHex(h));
-        st.tipTime = r.time; sinceSave++; dirty = true;
+        const u = node.undo.at(-1); deltas.append({ height: h, hash: r.hash, spent: u.spent.map(([key]) => key), created: u.created.map((key) => [key, utxo.get(key)]) });
+        st.tipTime = r.time; sinceSave++; dirty = false;
         api?.broadcast({ type: 'block', height: h, hash: r.hash, txs: r.txs, time: r.time });
         if (h % 50 === 0 || h === to) log(`block ${h} ${r.hash.slice(0, 16)}… ${r.txs} txs${h === to ? ' (tip)' : ''}`);
       }
       st.state = 'synced'; st.lastTickAt = Math.floor(Date.now() / 1000);
       if (st.nostr) st.nostr.agree = st.nostr.height > node.height ? null : node.chain[st.nostr.height] === st.nostr.hash;
-      if (sinceSave >= CKPT || (!st.checkpoint && dirty)) await checkpoint(sinceSave >= CKPT ? `${sinceSave} blocks` : 'first sync');
+      if (sinceSave >= CKPT) await checkpoint(`${sinceSave} blocks since the last`);
     } catch (e) { st.state = 'error: ' + e.message; log('tick error:', e.message); } finally { ticking = false; }
   }
 
@@ -236,14 +260,26 @@ async function run() {
   const t0 = performance.now(); const nip = await fetchTip(k, CHAIN.nip333);
   if (nip) { st.nostr = { height: nip.height, hash: nip.hash, relay: nip.relay, created_at: nip.created_at, agree: node.chain[nip.height] ? node.chain[nip.height] === nip.hash : null }; log(`nostr tip ${nip.height} ${nip.hash.slice(0, 16)}… (${Math.round(performance.now() - t0)} ms)`); }
   subscribeTip(k, CHAIN.nip333, (t) => { st.nostr = { ...t, agree: node.chain[t.height] ? node.chain[t.height] === t.hash : null }; log(`nostr: tip ${t.height} ${t.hash.slice(0, 16)}… via ${t.relay}`); if (t.height > node.height) setTimeout(() => tick('nostr'), 3000); }, { log });
-  const stop = async (sig) => { log(`${sig}: ${dirty ? 'checkpointing before exit' : 'nothing to save'}`); if (dirty) await checkpoint('shutdown'); process.exit(0); };
+  const stop = async (sig) => { log(`${sig}: state is in the delta log (${deltas.length} blocks above checkpoint ${st.checkpoint?.height ?? base.height}), exiting`); process.exit(0); };
   process.on('SIGINT', () => stop('SIGINT')); process.on('SIGTERM', () => stop('SIGTERM'));
   log(`running: height ${node.height}, ${utxo.size.toLocaleString()} coins, polling every ${POLL} s, checkpoint every ${CKPT} blocks`);
   await new Promise(() => {});
 }
 
+// Write the loaded set back out as a snapshot and compare it with what we loaded: the same
+// hash_serialized_3, coin count and bytes prove the writer and the packed iteration are exact.
+async function roundtrip() {
+  const utxo = load();
+  const out = `${DATA}/roundtrip.dat`;
+  const r = await writeSnapshot(out, utxo, { baseHeight: SNAPSHOT.baseHeight, baseHash: SNAPSHOT.baseHash, networkMagic: CHAIN.networkMagic, coins: utxo.size, log });
+  bench.roundtrip = { ms: +r.ms.toFixed(0), coins: r.coins, bytes: r.bytes, hashSerialized: r.hashSerialized, sha256: r.sha256, sameHash: r.hashSerialized === SNAPSHOT.txoutsetHash, sameBytes: r.bytes === SNAPSHOT.bytes, sameFile: r.sha256 === SNAPSHOT.sha256, rss: mb() };
+  log(`roundtrip: ${r.coins.toLocaleString()} coins, ${r.bytes} bytes, ${(r.ms / 1000).toFixed(1)} s, hash ${bench.roundtrip.sameHash ? 'same' : 'DIFFERENT'}, file sha256 ${bench.roundtrip.sameFile ? 'identical to the original' : 'differs'}`);
+  unlinkSync(out);
+}
+
 try {
   if (cmd === 'run') await run();
+  else if (cmd === 'roundtrip') await roundtrip();
   else if (cmd === 'fetch') await fetch();
   else if (cmd === 'verify') load();
   else if (cmd === 'sync') await sync(load());

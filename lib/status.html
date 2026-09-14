@@ -46,7 +46,7 @@ function render(st) {
   $('state').textContent = st.state; $('state').className = 'v ' + (st.state === 'synced' ? 'ok' : st.state === 'syncing' ? 'warn' : 'bad');
   $('since').textContent = `up ${Math.round(st.uptimeS/60)} min · last check ${ago(now - st.lastTickAt)} · ${st.rssMiB} MiB`;
   $('coins').textContent = st.coins.toLocaleString();
-  $('ckpt').textContent = st.checkpoint ? `checkpoint at ${st.checkpoint.height.toLocaleString()} · ${st.checkpoint.hash.slice(0,16)}… · ${(st.checkpoint.bytes/1048576).toFixed(0)} MiB${st.saving ? ' · saving now' : ''}` : 'no checkpoint yet';
+  $('ckpt').textContent = (st.checkpoint ? `checkpoint at ${st.checkpoint.height.toLocaleString()} · ${(st.checkpoint.bytes/1048576).toFixed(0)} MiB` : 'base: the fork snapshot') + ` · ${st.deltas ?? 0} block delta${st.deltas === 1 ? '' : 's'} on top${st.saving ? ' · writing a checkpoint' : ''}`;
   if (st.nostr) { $('nostr').textContent = st.nostr.height.toLocaleString(); $('nostr').className = 'v ' + (st.nostr.agree === false ? 'bad' : st.nostr.height <= st.height ? 'ok' : 'warn'); $('nostrs').textContent = `${st.nostr.hash.slice(0,16)}… · ${st.nostr.relay} · event ${ago(now - st.nostr.created_at)}${st.nostr.agree === false ? ' · DISAGREES with our chain' : st.nostr.agree ? ' · agrees' : ''}`; }
   else $('nostr').textContent = 'none yet';
   $('file').textContent = st.file ? `${st.file.from.toLocaleString()} – ${st.file.to.toLocaleString()}` : '…';

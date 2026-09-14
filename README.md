@@ -39,12 +39,14 @@ Part of the [bitcoin-blake](https://github.com/bitcoin-blake) family, next to
 
 4. **run**: the long-running node. It loads its newest checkpoint (a snapshot it wrote
    itself in the same dumptxoutset format, `hash_serialized_3` in the manifest) or the fork
-   snapshot, follows the block file every 30 s and on every NIP-333 event, applies new
-   blocks with undo records for the last 100 so a reorg is a pop, checkpoints every 100
-   blocks and on shutdown, and serves a status page, `/status.json`, `/block/<h>`,
+   snapshot through the packed index, replays its per-block delta log on top, follows the
+   block file every 30 s and on every NIP-333 event, applies new blocks with undo records
+   for the last 100 so a reorg is a pop, appends a delta after each block, writes a full
+   checkpoint every 2016 blocks, and serves a status page, `/status.json`, `/block/<h>`,
    `/header/<h>`, `/coin/<txid>:<vout>` and a `/tip` WebSocket stream on `--api` (3337).
-   A checkpoint written at 151,078 has the same `hash_serialized_3` as the Knots node
-   reports at that height, so the node's own snapshots are exact.
+   The snapshots it writes are exact: a checkpoint at 151,078 has the `hash_serialized_3`
+   the Knots node reports at that height, and `roundtrip` rewrites the fork snapshot from
+   the packed set byte for byte, same sha256. The daemon holds about 450 MB.
 
 ```
 node --max-old-space-size=8192 bin/blaketestnode.mjs run --api 3337 --blocks-url <url>   # the daemon (pm2 example in ops/)
@@ -57,9 +59,8 @@ node tools/export-blocks.mjs --loop 20                                 # keep th
 
 Options: `--data <dir>` (default `~/.blaketestnode/txbt4`), `--source http|rpc`, `--blocks-url <url>`,
 `--webseed <url>`, `--conf <bitcoin.conf>`, `--to <height>`, `--no-scripts`; for `run` also `--api <port>`,
-`--poll <seconds>`, `--checkpoint-every <blocks>`. A restart from a checkpoint takes about
-40 s; the first start from the fork snapshot about two minutes plus 90 s to write the
-first checkpoint. The engine is loaded from `$SCHEMA` or
+`--poll <seconds>`, `--checkpoint-every <blocks>` (2016). A restart with the index on disk
+takes seconds; building the index for a new snapshot takes about 20 s. The engine is loaded from `$SCHEMA` or
 `~/bitcoin-desktop/schema`; it needs bitcoin-desktop/schema v0.0.27 or later (unified sighash, pay-to-anchor).
 
 ## Snapshot
@@ -78,7 +79,7 @@ first checkpoint. The engine is loaded from `$SCHEMA` or
 |---|---|
 | torrent fetch | 870 MB in 9.8 s, 85 MiB/s (webseed + one peer) |
 | sha256 of file | 1.8 s |
-| parse + hash_serialized_3 | 26 s, 545k coins/s, 3.5 GB RSS |
+| parse + hash_serialized_3 | 14 s (26 s with the old string map); index build 3 s, reload 50 ms |
 | block file, 2.4 MB, 766 blocks | 0.8 s fetch, 1.4 s with hash and link checks |
 | NIP-333 tip from relays | tip 151,073 verified, 12 tail hashes agree with the file |
 | headers 150,308 to 151,073 | 766 validated, 0 failed, 150 ms |
@@ -96,7 +97,11 @@ validates with scripts on. Signature checks are about 48 of the 51 s, pure-JS se
 - `lib/params.mjs` chain and snapshot parameters, the only file that changes for mainnet
 - `lib/varint.mjs` Core VARINT, CompactSize, amount and script decompression
 - `lib/snapshot.mjs` snapshot parser and `hash_serialized_3`
-- `lib/utxo.mjs` UTXO set: snapshot coins as byte offsets, decoded on read
+- `lib/packed.mjs` the UTXO set: a packed index of the snapshot (16 bytes per coin, file
+  order, binary search on a txid prefix with the full txid checked in the file), a spent
+  bitmap, and a side map of new coins; built once in 3 s, read back in 50 ms, 230 MB
+- `lib/delta.mjs` per-block deltas appended after each block and replayed on restart
+- `lib/utxo.mjs` the earlier string-keyed map, kept for reference
 - `lib/fetch.mjs` WebTorrent fetch and sha256
 - `lib/blockfile.mjs`, `lib/source.mjs` the block file format and the http/rpc block sources
 - `lib/nip333.mjs` the chain tip from NIP-333 header events, one-shot and live
