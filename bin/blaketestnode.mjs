@@ -165,7 +165,7 @@ async function run() {
   const status = () => ({ network: CHAIN.network, alias: CHAIN.alias, height: node?.height ?? -1, hash: node?.tipHash() ?? null, tipTime: st.tipTime, coins: utxo?.size ?? 0, state: st.state, saving: st.saving,
     checkpoint: st.checkpoint, nostr: st.nostr, file: st.file, lastTickAt: st.lastTickAt, uptimeS: Math.floor((Date.now() - startedAt) / 1000), rssMiB: Math.round(process.memoryUsage().rss / 1048576),
     run: node ? { blocks: node.stats.blocks, txs: node.stats.txs, validateMs: Math.round(node.stats.validateMs), failed: node.stats.failed, rollbacks: st.rollbacks, startedFrom: st.startedFrom, skipped: node.stats.skipped } : { blocks: 0, txs: 0, validateMs: 0, failed: 0, rollbacks: 0, startedFrom: st.startedFrom } });
-  api = await startApi({ port: API, status, get node() { return node; }, source, k, log }); // before the long load, so a port clash fails fast
+  api = await startApi({ port: API, status, node: () => node, source, k, log }); // before the long load, so a port clash fails fast
   let file = await source.update(); st.file = { ...file, blocks: source.index.blocks.length, at: Math.floor(Date.now() / 1000) };
   const ctx = await source.contextHeaders(CHAIN.blocksUrl.replace(/-blocks$/, '-context-headers.json'));
   const magic = CHAIN.networkMagic;
