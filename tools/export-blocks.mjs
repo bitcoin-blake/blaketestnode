@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 // Keeps the served block file current from the local node: appends new post-fork blocks,
 // unwinds a reorg, and writes the context headers (the epoch before the fork) once.
-//   node tools/export-blocks.mjs [--dir ~/knots-testnet4/snapshots] [--loop <seconds>]
+//   node tools/export-blocks.mjs [--dir ~/knots-testnet4/snapshots] [--loop <seconds>] [--rsync user@host:path/]
+//   --rsync pushes the block file, its index and the context headers to a remote directory after every change
 import { existsSync, writeFileSync } from 'node:fs';
+import { execFile } from 'node:child_process';
 import { homedir } from 'node:os';
 import { CHAIN, SNAPSHOT } from '../lib/params.mjs';
 import { makeRpc } from '../lib/rpc.mjs';
@@ -12,6 +14,7 @@ const argv = process.argv.slice(2);
 const opt = (n, d) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : d; };
 const DIR = opt('--dir', `${homedir()}/knots-testnet4/snapshots`).replace(/^~/, homedir());
 const LOOP = opt('--loop') ? Number(opt('--loop')) : 0;
+const RSYNC = opt('--rsync', null);
 const name = `${CHAIN.alias}-blocks`;
 const dat = `${DIR}/${name}.dat`, idx = `${DIR}/${name}.json`, ctx = `${DIR}/${CHAIN.alias}-context-headers.json`;
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
@@ -44,6 +47,18 @@ async function once() {
   }
   if (added) { writeIndex(idx, index); log(`+${added} blocks, file now ${index.from}-${index.to} (${index.blocks.length} blocks)`); }
   else if (!existsSync(idx)) writeIndex(idx, index);
+  if (RSYNC && (added || !pushed)) await push();
+}
+let pushed = false;
+// the served copy: the data file first, then the index that points into it, so a reader never
+// sees an index entry the file does not yet have
+function push() {
+  return new Promise((resolve) => {
+    execFile('rsync', ['-a', '--partial', dat, ctx, RSYNC], (e1) => {
+      if (e1) { log(`rsync: ${e1.message}`); return resolve(); }
+      execFile('rsync', ['-a', idx, RSYNC], (e2) => { if (e2) log(`rsync: ${e2.message}`); else { pushed = true; log(`pushed to ${RSYNC}`); } resolve(); });
+    });
+  });
 }
 
 await once();
