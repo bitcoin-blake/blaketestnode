@@ -36,7 +36,17 @@ Part of the [bitcoin-blake](https://github.com/bitcoin-blake) family, next to
    blocks and unwinding reorgs; it is served at `https://melvin.me/datstr/snapshots/txbt4-blocks.{dat,json}`
    by a datstr gateway's `--files` directory.
 
+4. **run**: the long-running node. It loads its newest checkpoint (a snapshot it wrote
+   itself in the same dumptxoutset format, `hash_serialized_3` in the manifest) or the fork
+   snapshot, follows the block file every 30 s and on every NIP-333 event, applies new
+   blocks with undo records for the last 100 so a reorg is a pop, checkpoints every 100
+   blocks and on shutdown, and serves a status page, `/status.json`, `/block/<h>`,
+   `/header/<h>`, `/coin/<txid>:<vout>` and a `/tip` WebSocket stream on `--api` (3337).
+   A checkpoint written at 151,078 has the same `hash_serialized_3` as the Knots node
+   reports at that height, so the node's own snapshots are exact.
+
 ```
+node --max-old-space-size=8192 bin/blaketestnode.mjs run --api 3337    # the daemon (pm2 config in the repo)
 node --max-old-space-size=8192 bin/blaketestnode.mjs bench            # fetch, verify, sync: no node needed
 node bin/blaketestnode.mjs verify --data ./data                        # snapshot only
 node bin/blaketestnode.mjs sync --source rpc                           # blocks from the local node
@@ -45,7 +55,10 @@ node tools/export-blocks.mjs --loop 20                                 # keep th
 ```
 
 Options: `--data <dir>` (default `~/.blaketestnode/txbt4`), `--source http|rpc`,
-`--conf <bitcoin.conf>`, `--to <height>`, `--no-scripts`. The engine is loaded from `$SCHEMA` or
+`--conf <bitcoin.conf>`, `--to <height>`, `--no-scripts`; for `run` also `--api <port>`,
+`--poll <seconds>`, `--checkpoint-every <blocks>`. A restart from a checkpoint takes about
+40 s; the first start from the fork snapshot about two minutes plus 90 s to write the
+first checkpoint. The engine is loaded from `$SCHEMA` or
 `~/bitcoin-desktop/schema`; it needs bitcoin-desktop/schema v0.0.27 or later (unified sighash, pay-to-anchor).
 
 ## Snapshot
@@ -85,7 +98,11 @@ validates with scripts on. Signature checks are about 48 of the 51 s, pure-JS se
 - `lib/utxo.mjs` UTXO set: snapshot coins as byte offsets, decoded on read
 - `lib/fetch.mjs` WebTorrent fetch and sha256
 - `lib/blockfile.mjs`, `lib/source.mjs` the block file format and the http/rpc block sources
-- `lib/nip333.mjs` the chain tip from NIP-333 header events
+- `lib/nip333.mjs` the chain tip from NIP-333 header events, one-shot and live
+- `lib/node.mjs` the chain state machine: headers, applied hashes, undo records
+- `lib/state.mjs` checkpoints: the UTXO set written as a snapshot with a manifest
+- `lib/api.mjs`, `lib/status.html` the HTTP routes, tip stream and status page
+- `ops/blaketestnode.config.example.cjs` pm2 example
 - `tools/export-blocks.mjs` keeps the served block file current from a node
 - `lib/engine.mjs`, `lib/rpc.mjs` engine and node RPC loaders
 - `bin/blaketestnode.mjs` the CLI
