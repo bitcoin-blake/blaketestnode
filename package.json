@@ -1,0 +1,9 @@
+{
+  "name": "blaketestnode",
+  "version": "0.0.1",
+  "description": "Bitcoin BLAKE2b testnet4 (txbt4) node in JavaScript: assumeUTXO from the fork point, validated forward with the bitcoin-kernel engine",
+  "type": "module",
+  "bin": { "blaketestnode": "bin/blaketestnode.mjs" },
+  "license": "MIT",
+  "dependencies": { "webtorrent": "^3.0.0" }
+}
