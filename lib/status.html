@@ -2,46 +2,79 @@
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>blaketestnode</title>
 <style>
-  body{margin:0;padding:24px 16px;background:#0e1116;color:#d6dbe3;font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-  h1{font-size:18px;margin:0 0 4px} .sub{color:#8a94a6;margin-bottom:20px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;max-width:1100px}
-  .card{background:#161b24;border:1px solid #232a36;border-radius:8px;padding:14px 16px}
-  .k{color:#8a94a6} .v{font-size:22px;margin:2px 0 8px;word-break:break-all} .s{color:#8a94a6;font-size:12px;word-break:break-all}
-  .ok{color:#7ee787}.warn{color:#f0b429}.bad{color:#ff7b72}
-  table{width:100%;border-collapse:collapse;font-size:13px} td{padding:3px 0;border-bottom:1px solid #1e2531;vertical-align:top} td:first-child{color:#8a94a6;width:42%}
-  a{color:#79c0ff;text-decoration:none}
+  :root{--bg:#f6f7f9;--card:#fff;--line:#e3e6eb;--text:#1f2430;--muted:#6b7280;--ok:#15803d;--warn:#b45309;--bad:#b91c1c;--link:#1d4ed8;--okbg:#dcfce7}
+  body{margin:0;padding:24px 16px;background:var(--bg);color:var(--text);font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  h1{font-size:18px;margin:0 0 4px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .sub{color:var(--muted);margin-bottom:20px}
+  .live{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:normal;padding:2px 10px;border-radius:999px;border:1px solid var(--line);background:var(--card);color:var(--muted)}
+  .live .dot{width:8px;height:8px;border-radius:50%;background:#9ca3af}
+  .live.on{color:var(--ok);border-color:#bbf7d0;background:var(--okbg)} .live.on .dot{background:var(--ok);animation:pulse 1.6s ease-in-out infinite}
+  .live.off{color:var(--bad)} .live.off .dot{background:var(--bad)}
+  @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(21,128,61,.45)}50%{box-shadow:0 0 0 6px rgba(21,128,61,0)}}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;max-width:1200px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px 16px;box-shadow:0 1px 2px rgba(0,0,0,.03)}
+  .k{color:var(--muted)} .v{font-size:22px;margin:2px 0 8px;word-break:break-all} .s{color:var(--muted);font-size:12px;word-break:break-all}
+  .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+  table{width:100%;border-collapse:collapse;font-size:13px} td{padding:3px 6px 3px 0;border-bottom:1px solid var(--line);vertical-align:top;white-space:nowrap} td:first-child{color:var(--muted);width:1%;padding-right:16px}
+  a{color:var(--link);text-decoration:none}
+  .flash{animation:flash 1.2s ease-out} @keyframes flash{0%{background:var(--okbg)}100%{background:var(--card)}}
+  ul{list-style:none;margin:0;padding:0;font-size:13px} li{padding:3px 0;border-bottom:1px solid var(--line);display:flex;gap:10px} li span:first-child{color:var(--muted);min-width:9ch}
 </style>
-<h1>blaketestnode <span id="net"></span></h1>
-<div class="sub">a validating node from the fork-point snapshot, blocks from the served block file, tip checked against NIP-333 · <a href="/status.json">status.json</a></div>
+<h1>blaketestnode <span id="net"></span> <span class="live" id="live"><span class="dot"></span><span id="livetext">connecting</span></span></h1>
+<div class="sub">a validating node from the fork-point snapshot, blocks from the served block file, tip checked against NIP-333 · <a href="/status.json">status.json</a> · <span id="clock"></span></div>
 <div class="grid">
-  <div class="card"><div class="k">height</div><div class="v" id="height">…</div><div class="s" id="hash"></div><div class="s" id="age"></div></div>
+  <div class="card" id="tipcard"><div class="k">height</div><div class="v" id="height">…</div><div class="s" id="hash"></div><div class="s" id="age"></div></div>
   <div class="card"><div class="k">state</div><div class="v" id="state">…</div><div class="s" id="since"></div></div>
   <div class="card"><div class="k">utxo set</div><div class="v" id="coins">…</div><div class="s" id="ckpt"></div></div>
   <div class="card"><div class="k">nostr tip (NIP-333)</div><div class="v" id="nostr">…</div><div class="s" id="nostrs"></div></div>
   <div class="card"><div class="k">block file</div><div class="v" id="file">…</div><div class="s" id="files"></div></div>
   <div class="card"><div class="k">this run</div><table id="run"></table></div>
+  <div class="card"><div class="k">recent blocks (live from /tip)</div><ul id="recent"><li><span>…</span><span>waiting for the stream</span></li></ul></div>
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
 const ago = (s) => s == null ? '' : s < 90 ? `${s} s ago` : s < 5400 ? `${Math.round(s/60)} min ago` : `${(s/3600).toFixed(1)} h ago`;
+const hhmm = (t) => new Date(t*1000).toISOString().slice(11,19);
+let last = null;
+function render(st) {
+  last = st;
+  const now = Math.floor(Date.now()/1000);
+  $('net').textContent = st.alias;
+  $('height').textContent = st.height.toLocaleString();
+  $('hash').textContent = st.hash;
+  $('age').textContent = st.tipTime ? `block time ${new Date(st.tipTime*1000).toISOString().slice(0,19).replace('T',' ')} UTC · ${ago(now - st.tipTime)}` : '';
+  $('state').textContent = st.state; $('state').className = 'v ' + (st.state === 'synced' ? 'ok' : st.state === 'syncing' ? 'warn' : 'bad');
+  $('since').textContent = `up ${Math.round(st.uptimeS/60)} min · last check ${ago(now - st.lastTickAt)} · ${st.rssMiB} MiB`;
+  $('coins').textContent = st.coins.toLocaleString();
+  $('ckpt').textContent = st.checkpoint ? `checkpoint at ${st.checkpoint.height.toLocaleString()} · ${st.checkpoint.hash.slice(0,16)}… · ${(st.checkpoint.bytes/1048576).toFixed(0)} MiB${st.saving ? ' · saving now' : ''}` : 'no checkpoint yet';
+  if (st.nostr) { $('nostr').textContent = st.nostr.height.toLocaleString(); $('nostr').className = 'v ' + (st.nostr.agree === false ? 'bad' : st.nostr.height <= st.height ? 'ok' : 'warn'); $('nostrs').textContent = `${st.nostr.hash.slice(0,16)}… · ${st.nostr.relay} · event ${ago(now - st.nostr.created_at)}${st.nostr.agree === false ? ' · DISAGREES with our chain' : st.nostr.agree ? ' · agrees' : ''}`; }
+  else $('nostr').textContent = 'none yet';
+  $('file').textContent = st.file ? `${st.file.from.toLocaleString()} – ${st.file.to.toLocaleString()}` : '…';
+  $('files').textContent = st.file ? `${st.file.blocks} blocks · checked ${ago(now - st.file.at)}` : '';
+  $('run').innerHTML = [['blocks applied', st.run.blocks], ['transactions', st.run.txs], ['validate', `${(st.run.validateMs/1000).toFixed(1)} s`], ['rolled back', st.run.rollbacks], ['failed', st.run.failed], ['started from', st.run.startedFrom]].map(([k,v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+}
 async function tick() {
-  try {
-    const st = await (await fetch('status.json', { cache: 'no-store' })).json();
-    const now = Math.floor(Date.now()/1000);
-    $('net').textContent = st.alias;
-    $('height').textContent = st.height.toLocaleString();
-    $('hash').textContent = st.hash;
-    $('age').textContent = st.tipTime ? `block time ${new Date(st.tipTime*1000).toISOString().slice(0,19).replace('T',' ')} · ${ago(now - st.tipTime)}` : '';
-    $('state').textContent = st.state; $('state').className = 'v ' + (st.state === 'synced' ? 'ok' : st.state === 'syncing' ? 'warn' : 'bad');
-    $('since').textContent = `up ${Math.round(st.uptimeS/60)} min · last check ${ago(now - st.lastTickAt)} · ${st.rssMiB} MiB`;
-    $('coins').textContent = st.coins.toLocaleString();
-    $('ckpt').textContent = st.checkpoint ? `checkpoint at ${st.checkpoint.height.toLocaleString()} · ${st.checkpoint.hash.slice(0,16)}… · ${(st.checkpoint.bytes/1048576).toFixed(0)} MiB${st.saving ? ' · saving now' : ''}` : 'no checkpoint yet';
-    if (st.nostr) { $('nostr').textContent = st.nostr.height.toLocaleString(); $('nostr').className = 'v ' + (st.nostr.height <= st.height ? 'ok' : 'warn'); $('nostrs').textContent = `${st.nostr.hash.slice(0,16)}… · ${st.nostr.relay} · event ${ago(now - st.nostr.created_at)}${st.nostr.agree === false ? ' · DISAGREES' : ''}`; }
-    else $('nostr').textContent = 'none yet';
-    $('file').textContent = st.file ? `${st.file.from.toLocaleString()} – ${st.file.to.toLocaleString()}` : '…';
-    $('files').textContent = st.file ? `${st.file.blocks} blocks · fetched ${ago(now - st.file.at)}` : '';
-    $('run').innerHTML = [['blocks applied', st.run.blocks], ['transactions', st.run.txs], ['validate', `${(st.run.validateMs/1000).toFixed(1)} s`], ['rolled back', st.run.rollbacks], ['failed', st.run.failed], ['started from', st.run.startedFrom]].map(([k,v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
-  } catch (e) { $('state').textContent = 'unreachable'; $('state').className = 'v bad'; }
+  try { render(await (await fetch('status.json', { cache: 'no-store' })).json()); }
+  catch (e) { $('state').textContent = 'unreachable'; $('state').className = 'v bad'; }
 }
 tick(); setInterval(tick, 10000);
+setInterval(() => { $('clock').textContent = new Date().toISOString().slice(11,19) + ' UTC'; if (last) { const now = Math.floor(Date.now()/1000); $('since').textContent = `up ${Math.round(last.uptimeS/60)} min · last check ${ago(now - last.lastTickAt)} · ${last.rssMiB} MiB`; } }, 1000);
+// the live stream: connected = live, each block flashes the tip card and lands in the list
+const recent = [];
+function connect() {
+  const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + location.pathname.replace(/\/[^/]*$/, '') + '/tip');
+  ws.onopen = () => { $('live').className = 'live on'; $('livetext').textContent = 'live'; };
+  ws.onclose = () => { $('live').className = 'live off'; $('livetext').textContent = 'reconnecting'; setTimeout(connect, 5000); };
+  ws.onerror = () => ws.close();
+  ws.onmessage = (m) => {
+    const ev = JSON.parse(m.data);
+    if (ev.type === 'block') {
+      recent.unshift(ev); recent.length = Math.min(recent.length, 8);
+      $('recent').innerHTML = recent.map((b) => `<li><span>${hhmm(b.time)}</span><span>${b.height.toLocaleString()} · ${b.hash.slice(0,16)}… · ${b.txs} tx</span></li>`).join('');
+      $('tipcard').classList.remove('flash'); void $('tipcard').offsetWidth; $('tipcard').classList.add('flash');
+      tick();
+    } else if (ev.type === 'tip' && !recent.length) $('recent').innerHTML = `<li><span>now</span><span>tip ${ev.height.toLocaleString()} · ${(ev.hash||'').slice(0,16)}… · waiting for the next block</span></li>`;
+  };
+}
+connect();
 </script>
