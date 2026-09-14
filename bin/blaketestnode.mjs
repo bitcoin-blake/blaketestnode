@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// blaketestnode: fetch | verify | sync | bench   (--data <dir>, --source http|rpc, --conf <bitcoin.conf>, --no-scripts, --to <height>)
-import { readFileSync, mkdirSync, existsSync } from 'node:fs';
+// blaketestnode: fetch | verify | sync | bench | run   (--data <dir>, --source http|rpc, --conf <bitcoin.conf>, --no-scripts, --to <height>, --api <port>, --poll <s>, --checkpoint-every <n>)
+import { readFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { CHAIN, SNAPSHOT } from '../lib/params.mjs';
 import { parseSnapshot } from '../lib/snapshot.mjs';
@@ -9,7 +9,10 @@ import { loadEngine } from '../lib/engine.mjs';
 import { makeRpc } from '../lib/rpc.mjs';
 import { fetchSnapshot, sha256File } from '../lib/fetch.mjs';
 import { HttpBlockSource, RpcBlockSource } from '../lib/source.mjs';
-import { fetchTip } from '../lib/nip333.mjs';
+import { fetchTip, subscribeTip } from '../lib/nip333.mjs';
+import { ChainNode } from '../lib/node.mjs';
+import { listStates, saveState } from '../lib/state.mjs';
+import { startApi } from '../lib/api.mjs';
 
 const argv = process.argv.slice(2);
 const cmd = argv[0] ?? 'bench';
@@ -19,6 +22,7 @@ const CONF = opt('--conf', CHAIN.conf);
 const NO_SCRIPTS = argv.includes('--no-scripts');
 const TO = opt('--to') ? Number(opt('--to')) : null;
 const SOURCE = opt('--source', 'http'); // http: the served block file + NIP-333 tip; rpc: the local node
+const API = Number(opt('--api', 3336)); const POLL = Number(opt('--poll', 30)); const CKPT = Number(opt('--checkpoint-every', 100));
 const log = (...a) => console.error(new Date().toISOString().slice(11, 19), ...a);
 const bench = {};
 const mb = () => (process.memoryUsage().rss / 1048576).toFixed(0) + ' MiB rss';
@@ -148,8 +152,95 @@ async function sync(utxo) {
   } else { bench.crosscheck = { ourCoins: utxo.size, node: 'none' }; log(`utxo count: ${utxo.size.toLocaleString()} coins at ${tip} (no node to compare with)`); }
 }
 
+// The running node: load the newest checkpoint (or the fork snapshot), follow the block
+// file and the NIP-333 stream, apply new blocks, pop reorgs, checkpoint, serve status.
+async function run() {
+  const k = await loadEngine(CHAIN.network);
+  if (NO_SCRIPTS) k.blocks.interpreter = null;
+  const source = new HttpBlockSource(k, CHAIN.blocksUrl, DATA, { log });
+  const epochStart = Math.floor(SNAPSHOT.baseHeight / CHAIN.retargetInterval) * CHAIN.retargetInterval;
+  const startedAt = Date.now();
+  const st = { state: 'starting', nostr: null, file: null, checkpoint: null, saving: false, lastTickAt: null, rollbacks: 0, startedFrom: null, tipTime: null };
+  let node = null, utxo = null, api = null;
+  const status = () => ({ network: CHAIN.network, alias: CHAIN.alias, height: node?.height ?? -1, hash: node?.tipHash() ?? null, tipTime: st.tipTime, coins: utxo?.size ?? 0, state: st.state, saving: st.saving,
+    checkpoint: st.checkpoint, nostr: st.nostr, file: st.file, lastTickAt: st.lastTickAt, uptimeS: Math.floor((Date.now() - startedAt) / 1000), rssMiB: Math.round(process.memoryUsage().rss / 1048576),
+    run: node ? { blocks: node.stats.blocks, txs: node.stats.txs, validateMs: Math.round(node.stats.validateMs), failed: node.stats.failed, rollbacks: st.rollbacks, startedFrom: st.startedFrom, skipped: node.stats.skipped } : { blocks: 0, txs: 0, validateMs: 0, failed: 0, rollbacks: 0, startedFrom: st.startedFrom } });
+  api = await startApi({ port: API, status, get node() { return node; }, source, k, log }); // before the long load, so a port clash fails fast
+  let file = await source.update(); st.file = { ...file, blocks: source.index.blocks.length, at: Math.floor(Date.now() / 1000) };
+  const ctx = await source.contextHeaders(CHAIN.blocksUrl.replace(/-blocks$/, '-context-headers.json'));
+  const magic = CHAIN.networkMagic;
+
+  // newest checkpoint still on the served chain, else the fork snapshot
+  let base;
+  for (const m of listStates(DATA)) {
+    if (m.base_height > source.index.to || (await source.hash(m.base_height)) !== m.base_hash) { log(`checkpoint ${m.base_height} is not on the served chain, skipping`); continue; }
+    log(`loading checkpoint ${m.base_height} ${m.base_hash.slice(0, 16)}…`);
+    const buf = readFileSync(m.path); utxo = new UtxoSet(buf);
+    const r = parseSnapshot(buf, { log, onCoin: (txid, vout, off) => utxo.addSnapshotCoin(txid, vout, off) });
+    if (r.baseHash !== m.base_hash || r.hashSerialized !== m.txoutset_hash || r.coinsRead !== m.coins) { log('checkpoint corrupt, skipping'); utxo = null; continue; }
+    base = { height: m.base_height, hash: m.base_hash }; st.checkpoint = { height: m.base_height, hash: m.base_hash, bytes: m.bytes }; break;
+  }
+  if (!utxo) { utxo = load(); base = { height: SNAPSHOT.baseHeight, hash: SNAPSHOT.baseHash }; }
+  st.startedFrom = `${base.height}`;
+  node = new ChainNode({ k, utxo, epochStart, log });
+  node.loadContext(ctx.headers.map((h) => k.codec.decode('BlockHeader', h)));
+  node.setBase(base.height, base.hash);
+  // headers between the base and the checkpoint are needed for MTP and difficulty context
+  for (let h = SNAPSHOT.baseHeight + 1; h <= base.height; h++) { const b = k.codec.decode('Block', await source.blockHex(h)); node.headers[h] = b.header; node.chain[h] = await source.hash(h); }
+  if (base.height > SNAPSHOT.baseHeight) st.tipTime = node.headers[base.height].time;
+
+  let sinceSave = 0, ticking = false, dirty = false;
+
+  async function checkpoint(reason) {
+    if (st.saving) return;
+    st.saving = true; const t0 = performance.now();
+    try {
+      const m = await saveState(DATA, utxo, { height: node.height, hash: node.tipHash(), networkMagic: magic, network: CHAIN.network, log });
+      st.checkpoint = { height: m.base_height, hash: m.base_hash, bytes: m.bytes, txoutset_hash: m.txoutset_hash }; sinceSave = 0; dirty = false;
+      log(`checkpoint ${m.base_height} written (${reason}): ${m.coins.toLocaleString()} coins, ${(m.bytes / 1048576).toFixed(0)} MiB, hash_serialized_3 ${m.txoutset_hash.slice(0, 16)}…, ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+    } catch (e) { log('checkpoint failed:', e.message); } finally { st.saving = false; }
+  }
+
+  async function tick(reason) {
+    if (ticking) return; ticking = true;
+    try {
+      file = await source.update(); st.file = { ...file, blocks: source.index.blocks.length, at: Math.floor(Date.now() / 1000) };
+      // reorg: our applied hashes must match the served chain
+      let common = node.height;
+      while (common > SNAPSHOT.baseHeight && (await source.hash(common)) !== node.chain[common]) common--;
+      if (common < node.height) {
+        log(`reorg: served chain diverges above ${common}, rolling back ${node.height - common} block(s)`);
+        try { node.rollbackTo(common); st.rollbacks += node.height - common; dirty = true; }
+        catch (e) { log(`${e.message}; discarding checkpoints above ${common} and restarting`); for (const m of listStates(DATA)) if (m.base_height > common) { unlinkSync(m.path); unlinkSync(m.path.replace(/\.dat$/, '.json')); } process.exit(3); }
+      }
+      const to = source.index.to;
+      if (to > node.height) st.state = 'syncing';
+      for (let h = node.height + 1; h <= to; h++) {
+        const r = node.applyNext(h, await source.blockHex(h));
+        st.tipTime = r.time; sinceSave++; dirty = true;
+        api?.broadcast({ type: 'block', height: h, hash: r.hash, txs: r.txs, time: r.time });
+        if (h % 50 === 0 || h === to) log(`block ${h} ${r.hash.slice(0, 16)}… ${r.txs} txs${h === to ? ' (tip)' : ''}`);
+      }
+      st.state = 'synced'; st.lastTickAt = Math.floor(Date.now() / 1000);
+      if (st.nostr) st.nostr.agree = st.nostr.height > node.height ? null : node.chain[st.nostr.height] === st.nostr.hash;
+      if (sinceSave >= CKPT || (!st.checkpoint && dirty)) await checkpoint(sinceSave >= CKPT ? `${sinceSave} blocks` : 'first sync');
+    } catch (e) { st.state = 'error: ' + e.message; log('tick error:', e.message); } finally { ticking = false; }
+  }
+
+  await tick('start');
+  setInterval(() => tick('poll'), POLL * 1000);
+  const t0 = performance.now(); const nip = await fetchTip(k, CHAIN.nip333);
+  if (nip) { st.nostr = { height: nip.height, hash: nip.hash, relay: nip.relay, created_at: nip.created_at, agree: node.chain[nip.height] ? node.chain[nip.height] === nip.hash : null }; log(`nostr tip ${nip.height} ${nip.hash.slice(0, 16)}… (${Math.round(performance.now() - t0)} ms)`); }
+  subscribeTip(k, CHAIN.nip333, (t) => { st.nostr = { ...t, agree: node.chain[t.height] ? node.chain[t.height] === t.hash : null }; log(`nostr: tip ${t.height} ${t.hash.slice(0, 16)}… via ${t.relay}`); if (t.height > node.height) setTimeout(() => tick('nostr'), 3000); }, { log });
+  const stop = async (sig) => { log(`${sig}: ${dirty ? 'checkpointing before exit' : 'nothing to save'}`); if (dirty) await checkpoint('shutdown'); process.exit(0); };
+  process.on('SIGINT', () => stop('SIGINT')); process.on('SIGTERM', () => stop('SIGTERM'));
+  log(`running: height ${node.height}, ${utxo.size.toLocaleString()} coins, polling every ${POLL} s, checkpoint every ${CKPT} blocks`);
+  await new Promise(() => {});
+}
+
 try {
-  if (cmd === 'fetch') await fetch();
+  if (cmd === 'run') await run();
+  else if (cmd === 'fetch') await fetch();
   else if (cmd === 'verify') load();
   else if (cmd === 'sync') await sync(load());
   else if (cmd === 'bench') { await fetch(); await sync(load()); }

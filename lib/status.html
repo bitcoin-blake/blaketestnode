@@ -1,0 +1,47 @@
+<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>blaketestnode</title>
+<style>
+  body{margin:0;padding:24px 16px;background:#0e1116;color:#d6dbe3;font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  h1{font-size:18px;margin:0 0 4px} .sub{color:#8a94a6;margin-bottom:20px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;max-width:1100px}
+  .card{background:#161b24;border:1px solid #232a36;border-radius:8px;padding:14px 16px}
+  .k{color:#8a94a6} .v{font-size:22px;margin:2px 0 8px;word-break:break-all} .s{color:#8a94a6;font-size:12px;word-break:break-all}
+  .ok{color:#7ee787}.warn{color:#f0b429}.bad{color:#ff7b72}
+  table{width:100%;border-collapse:collapse;font-size:13px} td{padding:3px 0;border-bottom:1px solid #1e2531;vertical-align:top} td:first-child{color:#8a94a6;width:42%}
+  a{color:#79c0ff;text-decoration:none}
+</style>
+<h1>blaketestnode <span id="net"></span></h1>
+<div class="sub">a validating node from the fork-point snapshot, blocks from the served block file, tip checked against NIP-333 · <a href="/status.json">status.json</a></div>
+<div class="grid">
+  <div class="card"><div class="k">height</div><div class="v" id="height">…</div><div class="s" id="hash"></div><div class="s" id="age"></div></div>
+  <div class="card"><div class="k">state</div><div class="v" id="state">…</div><div class="s" id="since"></div></div>
+  <div class="card"><div class="k">utxo set</div><div class="v" id="coins">…</div><div class="s" id="ckpt"></div></div>
+  <div class="card"><div class="k">nostr tip (NIP-333)</div><div class="v" id="nostr">…</div><div class="s" id="nostrs"></div></div>
+  <div class="card"><div class="k">block file</div><div class="v" id="file">…</div><div class="s" id="files"></div></div>
+  <div class="card"><div class="k">this run</div><table id="run"></table></div>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const ago = (s) => s == null ? '' : s < 90 ? `${s} s ago` : s < 5400 ? `${Math.round(s/60)} min ago` : `${(s/3600).toFixed(1)} h ago`;
+async function tick() {
+  try {
+    const st = await (await fetch('status.json', { cache: 'no-store' })).json();
+    const now = Math.floor(Date.now()/1000);
+    $('net').textContent = st.alias;
+    $('height').textContent = st.height.toLocaleString();
+    $('hash').textContent = st.hash;
+    $('age').textContent = st.tipTime ? `block time ${new Date(st.tipTime*1000).toISOString().slice(0,19).replace('T',' ')} · ${ago(now - st.tipTime)}` : '';
+    $('state').textContent = st.state; $('state').className = 'v ' + (st.state === 'synced' ? 'ok' : st.state === 'syncing' ? 'warn' : 'bad');
+    $('since').textContent = `up ${Math.round(st.uptimeS/60)} min · last check ${ago(now - st.lastTickAt)} · ${st.rssMiB} MiB`;
+    $('coins').textContent = st.coins.toLocaleString();
+    $('ckpt').textContent = st.checkpoint ? `checkpoint at ${st.checkpoint.height.toLocaleString()} · ${st.checkpoint.hash.slice(0,16)}… · ${(st.checkpoint.bytes/1048576).toFixed(0)} MiB${st.saving ? ' · saving now' : ''}` : 'no checkpoint yet';
+    if (st.nostr) { $('nostr').textContent = st.nostr.height.toLocaleString(); $('nostr').className = 'v ' + (st.nostr.height <= st.height ? 'ok' : 'warn'); $('nostrs').textContent = `${st.nostr.hash.slice(0,16)}… · ${st.nostr.relay} · event ${ago(now - st.nostr.created_at)}${st.nostr.agree === false ? ' · DISAGREES' : ''}`; }
+    else $('nostr').textContent = 'none yet';
+    $('file').textContent = st.file ? `${st.file.from.toLocaleString()} – ${st.file.to.toLocaleString()}` : '…';
+    $('files').textContent = st.file ? `${st.file.blocks} blocks · fetched ${ago(now - st.file.at)}` : '';
+    $('run').innerHTML = [['blocks applied', st.run.blocks], ['transactions', st.run.txs], ['validate', `${(st.run.validateMs/1000).toFixed(1)} s`], ['rolled back', st.run.rollbacks], ['failed', st.run.failed], ['started from', st.run.startedFrom]].map(([k,v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+  } catch (e) { $('state').textContent = 'unreachable'; $('state').className = 'v bad'; }
+}
+tick(); setInterval(tick, 10000);
+</script>
