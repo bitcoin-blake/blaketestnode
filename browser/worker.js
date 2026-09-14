@@ -4,13 +4,33 @@ import { SNAPSHOT, CHAIN } from '../lib/params.mjs';
 import { Sha256 } from '../lib/sha256.mjs';
 import { buildIndex, indexBytes, parseIndexBytes } from '../lib/packed.mjs';
 import { bytesToHex } from '../lib/bytes.mjs';
+import { PackedUtxo } from '../lib/packed.mjs';
+import { ChainNode } from '../lib/node.mjs';
+import { fetchTip, subscribeTip } from '../lib/nip333.mjs';
+import { OpfsBlockSource } from './blocks.js';
+
+const CDN = 'https://cdn.jsdelivr.net/gh/bitcoin-desktop/schema@v0.0.27';
+let engine = null;
+async function loadEngine() {
+  if (engine) return engine;
+  const [{ createKernel }, { knotsBlake2b }, nostr] = await Promise.all([import(`${CDN}/codec/kernel.js`), import(`${CDN}/codec/overlays/knots-blake2b.js`), import(`${CDN}/codec/nostr.js`)]);
+  const j = async (p) => (await fetch(`${CDN}/${p}`)).json();
+  const k = createKernel({ core: await j('schema/core.jsonld'), proof: await j('schema/proof.jsonld'), script: await j('schema/script.jsonld'), chain: await j('schema/chain.jsonld'), validate: await j('schema/validate.jsonld'), network: CHAIN.network, overlays: [knotsBlake2b(await j('schema/overlays/knots-blake2b.jsonld'))] });
+  return (engine = { k, nostr });
+}
+// small-file helpers over OPFS for the block mirror
+const files = {
+  handle: (name, create = false) => open(name, create),
+  readText: (name) => readSmall(name),
+  writeText: (name, text) => writeSmall(name, text),
+};
 
 const post = (m) => self.postMessage(m);
 const log = (text) => post({ type: 'log', text });
 let root;
 const dir = async () => (root ??= await navigator.storage.getDirectory());
 async function open(name, create = false) { const fh = await (await dir()).getFileHandle(name, { create }); return fh.createSyncAccessHandle(); }
-async function sizeOf(name) { try { const h = await open(name); const n = h.getSize(); h.close(); return n; } catch { return -1; } }
+async function sizeOf(name) { if (name === SNAPSHOT.file && chain.snap) return chain.snap.getSize(); try { const h = await open(name); const n = h.getSize(); h.close(); return n; } catch { return -1; } }
 
 // { size, read(off, len) } over an OPFS sync access handle: the browser twin of FileBytes
 class OpfsBytes {
@@ -92,10 +112,90 @@ async function verify() {
 
 async function wipe() { const d = await dir(); for (const n of [SNAPSHOT.file, `${SNAPSHOT.file}.idx`, `${SNAPSHOT.file}.sha256`, `${SNAPSHOT.file}.ranges`]) { try { await d.removeEntry(n); } catch {} } }
 
+// ---- the chain: blocks from the served file, tip from the relays, validation against the set ----
+const chain = { node: null, utxo: null, source: null, snap: null, nostr: null, deltas: [], syncing: false, timer: null, blocksUrl: null };
+async function loadSet() {
+  if (chain.utxo) return chain.utxo;
+  const ih = await open(`${SNAPSHOT.file}.idx`); const ib = new Uint8Array(ih.getSize()); ih.read(ib, { at: 0 }); ih.close();
+  const index = parseIndexBytes(ib, SNAPSHOT.sha256);
+  chain.snap = await open(SNAPSHOT.file);
+  chain.utxo = new PackedUtxo(new OpfsBytes(chain.snap), index);
+  return chain.utxo;
+}
+async function sync(blocksUrl, { noScripts = false } = {}) {
+  if (chain.syncing) return; chain.syncing = true;
+  const t0 = performance.now();
+  try {
+    const { k, nostr } = await loadEngine();
+    if (noScripts) k.blocks.interpreter = null;
+    const utxo = await loadSet();
+    chain.blocksUrl = blocksUrl;
+    chain.source ??= new OpfsBlockSource(k, blocksUrl, files, { log });
+    const u = await chain.source.update();
+    post({ type: 'blockfile', ...u });
+    const epochStart = Math.floor(SNAPSHOT.baseHeight / CHAIN.retargetInterval) * CHAIN.retargetInterval;
+    if (!chain.node) {
+      const ctx = await chain.source.contextHeaders(blocksUrl.replace(/-blocks$/, '-context-headers.json'));
+      if (ctx.from !== epochStart || ctx.to !== SNAPSHOT.baseHeight) throw new Error('context headers cover the wrong range');
+      chain.node = new ChainNode({ k, utxo, epochStart, log });
+      chain.node.loadContext(ctx.headers.map((h) => k.codec.decode('BlockHeader', h)));
+      chain.node.setBase(SNAPSHOT.baseHeight, SNAPSHOT.baseHash);
+      // our own record of blocks applied in earlier sessions, replayed if it still follows the served chain
+      chain.deltas = JSON.parse((await readSmall('deltas.json')) ?? '[]');
+      let replayed = 0;
+      for (const d of chain.deltas) {
+        if (d.height !== chain.node.height + 1 || (await chain.source.hash(d.height)) !== d.hash) { chain.deltas.length = replayed; break; }
+        for (const key of d.spent) utxo.delete(key); for (const [key, coin] of d.created) utxo.set(key, coin);
+        const b = k.codec.decode('Block', await chain.source.blockHex(d.height)); chain.node.headers[d.height] = b.header; chain.node.chain[d.height] = d.hash; chain.node.height = d.height; replayed++;
+      }
+      if (replayed) log(`replayed ${replayed} blocks from this tab's delta log`);
+    }
+    // the relays' word on the tip, checked against the file's tail
+    const nip = await fetchTip(k, CHAIN.nip333, { nostr });
+    if (nip) {
+      let agree = 0; for (let i = 0; i < nip.headers.length; i++) { const h = nip.first + i; const have = await chain.source.hash(h); if (have && have !== k.codec.blockHash(nip.headers[i])) throw new Error(`block file disagrees with the NIP-333 headers at ${h}`); if (have) agree++; }
+      chain.nostr = { height: nip.height, hash: nip.hash, relay: nip.relay, created_at: nip.created_at, agree };
+      post({ type: 'nostr', ...chain.nostr });
+    }
+    // rollback if the served chain diverged from what we applied
+    let common = chain.node.height;
+    while (common > SNAPSHOT.baseHeight && (await chain.source.hash(common)) !== chain.node.chain[common]) common--;
+    if (common < chain.node.height) { log(`reorg: rolling back ${chain.node.height - common} block(s)`); chain.node.rollbackTo(common); chain.deltas = chain.deltas.filter((d) => d.height <= common); await writeSmall('deltas.json', JSON.stringify(chain.deltas)); }
+    const to = await chain.source.tip();
+    let applied = 0, txs = 0;
+    for (let h = chain.node.height + 1; h <= to; h++) {
+      const r = chain.node.applyNext(h, await chain.source.blockHex(h));
+      const uu = chain.node.undo.at(-1); chain.deltas.push({ height: h, hash: r.hash, spent: uu.spent.map(([key]) => key), created: uu.created.map((key) => [key, utxo.get(key)]) });
+      applied++; txs += r.txs;
+      if (applied % 20 === 0 || h === to) post({ type: 'progress', height: h, to, applied, txs, ms: performance.now() - t0, coins: utxo.size });
+    }
+    if (applied) await writeSmall('deltas.json', JSON.stringify(chain.deltas));
+    post({ type: 'synced', height: chain.node.height, hash: chain.node.tipHash(), time: chain.node.headers[chain.node.height]?.time ?? null, coins: utxo.size, applied, txs, ms: performance.now() - t0, stats: chain.node.stats, scripts: !noScripts });
+    if (!chain.timer) {
+      chain.timer = setInterval(() => sync(chain.blocksUrl, { noScripts }).catch((e) => post({ type: 'error', text: e.message })), 30_000);
+      subscribeTip(k, CHAIN.nip333, (t) => { chain.nostr = { ...t, agree: chain.node.chain[t.height] ? 1 : 0 }; post({ type: 'nostr', ...chain.nostr, live: true }); if (t.height > chain.node.height) setTimeout(() => sync(chain.blocksUrl, { noScripts }).catch(() => {}), 3000); }, { nostr, log });
+    }
+  } finally { chain.syncing = false; }
+}
+async function coin(key) {
+  const { k } = await loadEngine(); const utxo = await loadSet();
+  const c = utxo.get(key);
+  if (!c) return post({ type: 'coin', key, found: false });
+  const cl = k.script.classify(c.output.scriptPubKey);
+  post({ type: 'coin', key, found: true, value: c.output.value, height: c.height, coinbase: c.coinbase, scriptType: cl.type, address: cl.address, scriptPubKey: c.output.scriptPubKey });
+}
+
 self.onmessage = async (e) => {
   const m = e.data;
   try {
-    if (m.type === 'status') await status();
+    if (m.type === 'sync') await sync(m.blocksUrl, { noScripts: !!m.noScripts });
+    else if (m.type === 'debug') {
+      const u = chain.utxo; const c = u?.get(m.key) ?? null; let cl = null, err = null;
+      try { cl = engine?.k?.script ? engine.k.script.classify(c.output.scriptPubKey) : 'no k.script: ' + Object.keys(engine?.k ?? {}).join(','); } catch (e) { err = e.message + ' ' + (e.stack ?? '').split('\n').slice(0, 3).join(' / '); }
+      post({ type: 'debug', key: m.key, hasUtxo: !!u, fresh: u?.fresh.size, freshHas: u?.fresh.has(m.key), get: c, classify: cl, err, height: chain.node?.height, deltas: chain.deltas.length });
+    }
+    else if (m.type === 'coin') await coin(m.key);
+    else if (m.type === 'status') await status();
     else if (m.type === 'fetch') { await fetchSnapshot(m.url); await status(); }
     else if (m.type === 'hash') { const hex = await hashFile(); post({ type: 'fetched', bytes: await sizeOf(SNAPSHOT.file), ms: 0, sha256: hex, ok: hex === SNAPSHOT.sha256 }); await status(); }
     else if (m.type === 'verify') { await verify(); await status(); }

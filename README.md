@@ -72,8 +72,15 @@ through a sync access handle and keeps the 217 MB index beside it. Nothing leave
 and no server is trusted: the pinned sha256 and `hash_serialized_3` decide. Give it a
 snapshot URL with `?snapshot=` (a plain file with Range and CORS). Measured in Chromium
 on this machine: fetch 2 s from a local server, sha256 15 s, parse plus index 37 s.
-Storage needed is about 1.1 GB; the page shows the origin's quota first. Blocks and
-validation in the tab are the next step.
+Storage needed is about 1.1 GB; the page shows the origin's quota first.
+
+With `?blocks=` (the served block file, as for the daemon) the tab is a node: the worker
+mirrors the block file into OPFS with the same hash and link checks, takes the tip from
+the NIP-333 relays and requires it to agree with the file's tail, validates every block
+against its own UTXO set with the engine from jsDelivr (signatures included), keeps a
+delta log so a reload replays in seconds, then follows the tip every 30 s and on every
+NIP-333 event. Measured in Chromium: 797 blocks validated in 48 s, replay 9 s, a new
+block applied live. A coin lookup box answers from the tab's own set.
 
 ## Snapshot
 
@@ -116,7 +123,7 @@ validates with scripts on. Signature checks are about 48 of the 51 s, pure-JS se
 - `lib/bytes.mjs`, `lib/sha256.mjs` byte helpers and an incremental SHA-256, so the parser
   and index run unchanged in Node and in a worker
 - `lib/snapshot-write.mjs`, `lib/filebytes.mjs` the Node-only writer and file access
-- `browser/index.html`, `browser/worker.js` the page and its worker
+- `browser/index.html`, `browser/worker.js`, `browser/blocks.js` the page, its worker and the block mirror over OPFS
 - `lib/fetch.mjs` WebTorrent fetch and sha256
 - `lib/blockfile.mjs`, `lib/source.mjs` the block file format and the http/rpc block sources
 - `lib/nip333.mjs` the chain tip from NIP-333 header events, one-shot and live

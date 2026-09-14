@@ -26,7 +26,17 @@
   <div class="card"><div class="k">storage</div><div class="v" id="storage">…</div><div class="s" id="storages"></div></div>
   <div class="card"><div class="k">snapshot on disk</div><div class="v" id="dat">…</div><progress id="fetchbar" max="100" value="0" hidden></progress><div class="s" id="dats"></div></div>
   <div class="card"><div class="k">verification</div><div class="v" id="ver">…</div><div class="s" id="vers"></div></div>
-  <div class="card"><div class="k">index</div><div class="v" id="idx">…</div><div class="s" id="idxs"></div></div>
+  <div class="card"><div class="k">index</div><div class="v" id="idx">…</div><div class="s" id="idxs"></div><div class="s">coins now: <span id="coins">…</span></div></div>
+  <div class="card">
+    <div class="k">blocks source</div>
+    <input id="blocks" placeholder="https://…/txbt4-blocks (the served block file, without .dat/.json; ?blocks= sets it)">
+    <div><button id="sync" class="primary">sync to the tip</button> <label class="s"><input type="checkbox" id="noscripts" style="width:auto;margin:0 4px 0 0">skip signature checks</label></div>
+  </div>
+  <div class="card" id="tipcard"><div class="k">height</div><div class="v" id="height">…</div><div class="s" id="hash"></div><div class="s" id="age"></div></div>
+  <div class="card"><div class="k">nostr tip (NIP-333)</div><div class="v" id="nostr">…</div><div class="s" id="nostrs"></div></div>
+  <div class="card"><div class="k">block file</div><div class="v" id="file">…</div><div class="s" id="files"></div></div>
+  <div class="card"><div class="k">validation</div><div class="v" id="val">…</div><progress id="valbar" max="100" value="0" hidden></progress><div class="s" id="vals"></div></div>
+  <div class="card"><div class="k">coin lookup</div><input id="coinkey" placeholder="txid:vout"><button id="coingo">look up</button><div class="s" id="coin" style="margin-top:6px"></div></div>
   <div class="card" style="grid-column:1/-1"><div class="k">log</div><div class="log" id="log"></div></div>
 </div>
 <script type="module">
@@ -35,17 +45,25 @@ const mib = (n) => `${(n / 1048576).toFixed(0)} MiB`;
 const logEl = $('log'); const log = (t) => { logEl.textContent += `${new Date().toISOString().slice(11, 19)} ${t}\n`; logEl.scrollTop = logEl.scrollHeight; };
 const params = new URLSearchParams(location.search);
 $('url').value = params.get('snapshot') ?? localStorage.getItem('snapshotUrl') ?? '';
+$('blocks').value = params.get('blocks') ?? localStorage.getItem('blocksUrl') ?? '';
+const ago = (s) => s == null ? '' : s < 90 ? `${s} s ago` : s < 5400 ? `${Math.round(s/60)} min ago` : `${(s/3600).toFixed(1)} h ago`;
+const now = () => Math.floor(Date.now() / 1000);
 let st = null, busy = false;
 const worker = new Worker('./worker.js', { type: 'module' });
 worker.onmessage = (e) => {
   const m = e.data;
   if (m.type === 'log') log(m.text);
   else if (m.type === 'error') { log('error: ' + m.text); busy = false; buttons(); }
-  else if (m.type === 'status') { st = m; render(); busy = false; buttons(); }
+  else if (m.type === 'status') { const first = !st; st = m; render(); busy = false; buttons(); if (first && st.idx > 0 && $('blocks').value.trim()) $('sync').click(); }
   else if (m.type === 'fetch') { $('fetchbar').hidden = false; $('fetchbar').value = m.have / m.total * 100; $('dat').textContent = `${mib(m.have)} of ${mib(m.total)}`; $('dats').textContent = `${(m.rate / 1048576).toFixed(1)} MiB/s`; }
   else if (m.type === 'fetched') { $('fetchbar').hidden = true; log(`fetched ${mib(m.bytes)} in ${(m.ms / 1000).toFixed(1)} s, sha256 ${m.ok ? 'matches' : 'MISMATCH ' + m.sha256}`); }
   else if (m.type === 'hashing') $('dats').textContent = `hashing ${mib(m.at)} of ${mib(m.total)}`;
   else if (m.type === 'parsing') { $('ver').textContent = 'parsing'; $('vers').textContent = m.text.trim(); }
+  else if (m.type === 'blockfile') { $('file').textContent = `${m.from.toLocaleString()} – ${m.to.toLocaleString()}`; $('files').textContent = `${m.blocks} blocks · ${m.fetched} bytes fetched · ${m.verified} records checked`; }
+  else if (m.type === 'nostr') { $('nostr').textContent = m.height.toLocaleString(); $('nostr').className = 'v ok'; $('nostrs').textContent = `${m.hash.slice(0, 16)}… · ${m.relay} · event ${ago(now() - m.created_at)} · ${m.agree} tail hashes agree with the file${m.live ? ' · live' : ''}`; }
+  else if (m.type === 'progress') { $('valbar').hidden = false; $('valbar').value = m.applied / Math.max(1, m.to - (m.height - m.applied)) * 100; $('val').textContent = `block ${m.height.toLocaleString()} of ${m.to.toLocaleString()}`; $('vals').textContent = `${m.applied} blocks, ${m.txs} txs, ${(m.ms / 1000).toFixed(1)} s`; $('height').textContent = m.height.toLocaleString(); $('coins').textContent = m.coins.toLocaleString(); }
+  else if (m.type === 'synced') { $('valbar').hidden = true; $('val').textContent = 'synced'; $('val').className = 'v ok'; $('vals').textContent = `${m.applied} blocks applied this pass, ${m.txs} txs, ${(m.ms / 1000).toFixed(1)} s${m.scripts ? ', signatures checked' : ', signatures skipped'} · ${m.stats.failed} failed`; $('height').textContent = m.height.toLocaleString(); $('hash').textContent = m.hash; $('age').textContent = m.time ? `block time ${new Date(m.time * 1000).toISOString().slice(0, 19).replace('T', ' ')} UTC · ${ago(now() - m.time)}` : ''; $('coins').textContent = m.coins.toLocaleString(); log(`synced to ${m.height.toLocaleString()}: ${m.applied} blocks in ${(m.ms / 1000).toFixed(1)} s`); busy = false; buttons(); }
+  else if (m.type === 'coin') $('coin').textContent = m.found ? `${m.value.toLocaleString()} sats · ${m.scriptType} ${m.address ?? ''} · created at ${m.height.toLocaleString()}${m.coinbase ? ' (coinbase)' : ''}` : 'not in the set';
   else if (m.type === 'verified') log(`verified in ${(m.ms / 1000).toFixed(1)} s: ${m.coins.toLocaleString()} coins in ${m.txids.toLocaleString()} txids, hash_serialized_3 ${m.hashSerialized.slice(0, 16)}… ${m.ok ? 'matches' : 'MISMATCH'}; index ${mib(m.indexBytes)}`);
 };
 function render() {
@@ -62,10 +80,13 @@ function render() {
   $('idx').textContent = hasIdx ? mib(st.idx) : 'absent'; $('idx').className = 'v ' + (hasIdx ? 'ok' : '');
   $('idxs').textContent = hasIdx ? `${st.expect.coins.toLocaleString()} entries of 16 bytes, binary-searched by txid; the set is ready for blocks` : '';
 }
-function buttons() { $('go').disabled = busy; $('verify').disabled = busy || !(st && st.dat === st.expect.bytes); $('wipe').disabled = busy; }
+function buttons() { $('go').disabled = busy; $('verify').disabled = busy || !(st && st.dat === st.expect.bytes); $('wipe').disabled = busy; $('sync').disabled = busy || !(st && st.idx > 0); }
+$('sync').onclick = () => { const url = $('blocks').value.trim(); if (!url) return log('give a blocks URL'); localStorage.setItem('blocksUrl', url); busy = true; buttons(); log(`syncing from ${url}`); worker.postMessage({ type: 'sync', blocksUrl: url, noScripts: $('noscripts').checked }); };
+$('coingo').onclick = () => { const key = $('coinkey').value.trim(); if (/^[0-9a-f]{64}:\d+$/i.test(key)) worker.postMessage({ type: 'coin', key: key.toLowerCase() }); else $('coin').textContent = 'txid:vout, please'; };
 $('go').onclick = () => { const url = $('url').value.trim(); if (!url) return log('give a snapshot URL'); localStorage.setItem('snapshotUrl', url); busy = true; buttons(); log(`fetching from ${url}`); worker.postMessage(st && st.dat === st.expect.bytes ? { type: st.sha ? 'verify' : 'hash' } : { type: 'fetch', url }); };
 $('verify').onclick = () => { busy = true; buttons(); log('verifying'); worker.postMessage({ type: st.sha ? 'verify' : 'hash' }); };
 $('wipe').onclick = () => { busy = true; buttons(); worker.postMessage({ type: 'wipe' }); };
 worker.onmessage = ((inner) => (e) => { inner(e); if (e.data.type === 'fetched' && e.data.ok) { log('verifying'); worker.postMessage({ type: 'verify' }); } })(worker.onmessage);
+window.__worker = worker; // for debugging from the console
 worker.postMessage({ type: 'status' });
 </script>
