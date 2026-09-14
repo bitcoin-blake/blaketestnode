@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// blaketestnode: fetch | verify | sync | bench | run   (--data <dir>, --source http|rpc, --conf <bitcoin.conf>, --no-scripts, --to <height>, --api <port>, --poll <s>, --checkpoint-every <n>)
+// blaketestnode: fetch | verify | sync | bench | run   (--data <dir>, --source http|rpc, --blocks-url <url>, --webseed <url>, --conf <bitcoin.conf>, --no-scripts, --to <height>, --api <port>, --poll <s>, --checkpoint-every <n>)
 import { readFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { CHAIN, SNAPSHOT } from '../lib/params.mjs';
@@ -21,7 +21,9 @@ const DATA = opt('--data', `${homedir()}/.blaketestnode/${CHAIN.alias}`).replace
 const CONF = opt('--conf', CHAIN.conf);
 const NO_SCRIPTS = argv.includes('--no-scripts');
 const TO = opt('--to') ? Number(opt('--to')) : null;
-const SOURCE = opt('--source', 'http'); // http: the served block file + NIP-333 tip; rpc: the local node
+const SOURCE = opt('--source', 'http'); // http: a served block file + NIP-333 tip; rpc: the local node
+if (opt('--blocks-url')) CHAIN.blocksUrl = opt('--blocks-url');
+if (opt('--webseed')) SNAPSHOT.webseed = opt('--webseed');
 const API = Number(opt('--api', 3336)); const POLL = Number(opt('--poll', 30)); const CKPT = Number(opt('--checkpoint-every', 100));
 const log = (...a) => console.error(new Date().toISOString().slice(11, 19), ...a);
 const bench = {};
@@ -60,6 +62,7 @@ async function sync(utxo) {
   let rpc = null;
   if (!http || existsSync(CONF.replace(/^~/, homedir()))) { try { rpc = await makeRpc(CONF, CHAIN.network); await rpc('getblockcount'); } catch { rpc = null; } }
   if (!http && !rpc) throw new Error(`--source rpc needs a node at ${CONF}`);
+  if (http && !CHAIN.blocksUrl) throw new Error('no block source: pass --blocks-url <url> (a served txbt4-blocks file) or --source rpc');
   const source = http ? new HttpBlockSource(k, CHAIN.blocksUrl, DATA, { log }) : new RpcBlockSource(rpc);
   const epochStart = Math.floor(SNAPSHOT.baseHeight / CHAIN.retargetInterval) * CHAIN.retargetInterval;
   const startHeight = SNAPSHOT.baseHeight + 1;
@@ -157,6 +160,7 @@ async function sync(utxo) {
 async function run() {
   const k = await loadEngine(CHAIN.network);
   if (NO_SCRIPTS) k.blocks.interpreter = null;
+  if (!CHAIN.blocksUrl) throw new Error('run needs --blocks-url <url> (a served txbt4-blocks file)');
   const source = new HttpBlockSource(k, CHAIN.blocksUrl, DATA, { log });
   const epochStart = Math.floor(SNAPSHOT.baseHeight / CHAIN.retargetInterval) * CHAIN.retargetInterval;
   const startedAt = Date.now();

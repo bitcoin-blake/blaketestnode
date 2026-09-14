@@ -33,8 +33,9 @@ Part of the [bitcoin-blake](https://github.com/bitcoin-blake) family, next to
    - **rpc**: the local Knots node, as before.
 
    The block file is kept current by `tools/export-blocks.mjs` from a node, appending new
-   blocks and unwinding reorgs; it is served at `https://melvin.me/datstr/snapshots/txbt4-blocks.{dat,json}`
-   by a datstr gateway's `--files` directory.
+   blocks and unwinding reorgs. Any host that serves the two files with Range requests and
+   CORS will do (a datstr gateway's `--files` directory does); pass it as `--blocks-url`
+   or `BLAKETESTNODE_BLOCKS_URL`.
 
 4. **run**: the long-running node. It loads its newest checkpoint (a snapshot it wrote
    itself in the same dumptxoutset format, `hash_serialized_3` in the manifest) or the fork
@@ -46,7 +47,7 @@ Part of the [bitcoin-blake](https://github.com/bitcoin-blake) family, next to
    reports at that height, so the node's own snapshots are exact.
 
 ```
-node --max-old-space-size=8192 bin/blaketestnode.mjs run --api 3337    # the daemon (pm2 config in the repo)
+node --max-old-space-size=8192 bin/blaketestnode.mjs run --api 3337 --blocks-url <url>   # the daemon (pm2 example in ops/)
 node --max-old-space-size=8192 bin/blaketestnode.mjs bench            # fetch, verify, sync: no node needed
 node bin/blaketestnode.mjs verify --data ./data                        # snapshot only
 node bin/blaketestnode.mjs sync --source rpc                           # blocks from the local node
@@ -54,8 +55,8 @@ node bin/blaketestnode.mjs sync --no-scripts                           # skip si
 node tools/export-blocks.mjs --loop 20                                 # keep the served block file current (needs a node)
 ```
 
-Options: `--data <dir>` (default `~/.blaketestnode/txbt4`), `--source http|rpc`,
-`--conf <bitcoin.conf>`, `--to <height>`, `--no-scripts`; for `run` also `--api <port>`,
+Options: `--data <dir>` (default `~/.blaketestnode/txbt4`), `--source http|rpc`, `--blocks-url <url>`,
+`--webseed <url>`, `--conf <bitcoin.conf>`, `--to <height>`, `--no-scripts`; for `run` also `--api <port>`,
 `--poll <seconds>`, `--checkpoint-every <blocks>`. A restart from a checkpoint takes about
 40 s; the first start from the fork snapshot about two minutes plus 90 s to write the
 first checkpoint. The engine is loaded from `$SCHEMA` or
@@ -69,7 +70,7 @@ first checkpoint. The engine is loaded from `$SCHEMA` or
 | txoutset_hash | `372bfcaeef1e93892acccda9e700b00bf90f45d73746d69959d33620a3df5518` |
 | coins | 14,230,182 in 9,356,185 txids, 869,836,053 bytes |
 | infohash | `242e9b7dcba15cc0ed8f1bc5f06b68da008f87c0` |
-| webseed | https://melvin.me/datstr/snapshots/utxo-knots-150307.dat |
+| webseed | optional, `--webseed <url>` or `BLAKETESTNODE_WEBSEED`; peers and the NIP-35 event carry the rest |
 
 ## Benchmark (14 Sep 2026, one core of a desktop, Node 24)
 
