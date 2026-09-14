@@ -1,0 +1,71 @@
+<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>blaketestnode in the browser</title>
+<style>
+  :root{--bg:#f6f7f9;--card:#fff;--line:#e3e6eb;--text:#1f2430;--muted:#6b7280;--ok:#15803d;--warn:#b45309;--bad:#b91c1c;--link:#1d4ed8;--okbg:#dcfce7}
+  body{margin:0;padding:24px 16px;background:var(--bg);color:var(--text);font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  h1{font-size:18px;margin:0 0 4px} .sub{color:var(--muted);margin-bottom:20px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;max-width:1100px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px 16px}
+  .k{color:var(--muted)} .v{font-size:20px;margin:2px 0 8px;word-break:break-all} .s{color:var(--muted);font-size:12px;word-break:break-all}
+  .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+  input{font:inherit;width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid var(--line);border-radius:6px;margin:4px 0 8px}
+  button{font:inherit;padding:6px 12px;border:1px solid var(--line);border-radius:6px;background:#fff;cursor:pointer;margin-right:6px} button:disabled{opacity:.5;cursor:default} button.primary{background:var(--ok);color:#fff;border-color:var(--ok)}
+  progress{width:100%;height:10px} .log{font-size:12px;color:var(--muted);max-height:180px;overflow:auto;white-space:pre-wrap;margin-top:8px}
+  a{color:var(--link);text-decoration:none}
+</style>
+<h1>blaketestnode <span id="net"></span> · in the browser</h1>
+<div class="sub">the fork-point UTXO snapshot fetched into this tab's own storage, its hash recomputed, its index built, all inside a worker · nothing leaves the tab</div>
+<div class="grid">
+  <div class="card">
+    <div class="k">snapshot source</div>
+    <input id="url" placeholder="https://…/utxo-knots-150307.dat (a plain file URL with Range and CORS; ?snapshot= sets it)">
+    <div class="s">expected: <span id="expect"></span></div>
+    <div style="margin-top:8px"><button id="go" class="primary">fetch and verify</button><button id="verify">verify only</button><button id="wipe">wipe</button></div>
+  </div>
+  <div class="card"><div class="k">storage</div><div class="v" id="storage">…</div><div class="s" id="storages"></div></div>
+  <div class="card"><div class="k">snapshot on disk</div><div class="v" id="dat">…</div><progress id="fetchbar" max="100" value="0" hidden></progress><div class="s" id="dats"></div></div>
+  <div class="card"><div class="k">verification</div><div class="v" id="ver">…</div><div class="s" id="vers"></div></div>
+  <div class="card"><div class="k">index</div><div class="v" id="idx">…</div><div class="s" id="idxs"></div></div>
+  <div class="card" style="grid-column:1/-1"><div class="k">log</div><div class="log" id="log"></div></div>
+</div>
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const mib = (n) => `${(n / 1048576).toFixed(0)} MiB`;
+const logEl = $('log'); const log = (t) => { logEl.textContent += `${new Date().toISOString().slice(11, 19)} ${t}\n`; logEl.scrollTop = logEl.scrollHeight; };
+const params = new URLSearchParams(location.search);
+$('url').value = params.get('snapshot') ?? localStorage.getItem('snapshotUrl') ?? '';
+let st = null, busy = false;
+const worker = new Worker('./worker.js', { type: 'module' });
+worker.onmessage = (e) => {
+  const m = e.data;
+  if (m.type === 'log') log(m.text);
+  else if (m.type === 'error') { log('error: ' + m.text); busy = false; buttons(); }
+  else if (m.type === 'status') { st = m; render(); busy = false; buttons(); }
+  else if (m.type === 'fetch') { $('fetchbar').hidden = false; $('fetchbar').value = m.have / m.total * 100; $('dat').textContent = `${mib(m.have)} of ${mib(m.total)}`; $('dats').textContent = `${(m.rate / 1048576).toFixed(1)} MiB/s`; }
+  else if (m.type === 'fetched') { $('fetchbar').hidden = true; log(`fetched ${mib(m.bytes)} in ${(m.ms / 1000).toFixed(1)} s, sha256 ${m.ok ? 'matches' : 'MISMATCH ' + m.sha256}`); }
+  else if (m.type === 'hashing') $('dats').textContent = `hashing ${mib(m.at)} of ${mib(m.total)}`;
+  else if (m.type === 'parsing') { $('ver').textContent = 'parsing'; $('vers').textContent = m.text.trim(); }
+  else if (m.type === 'verified') log(`verified in ${(m.ms / 1000).toFixed(1)} s: ${m.coins.toLocaleString()} coins in ${m.txids.toLocaleString()} txids, hash_serialized_3 ${m.hashSerialized.slice(0, 16)}… ${m.ok ? 'matches' : 'MISMATCH'}; index ${mib(m.indexBytes)}`);
+};
+function render() {
+  $('net').textContent = st.expect.alias;
+  $('expect').textContent = `${st.expect.bytes.toLocaleString()} bytes, sha256 ${st.expect.sha256.slice(0, 12)}…, ${st.expect.coins.toLocaleString()} coins at ${st.expect.baseHeight.toLocaleString()}`;
+  $('storage').textContent = st.quota ? `${mib(st.usage)} used of ${(st.quota / 1073741824).toFixed(1)} GiB` : 'unknown'; $('storage').className = 'v ' + (st.quota && st.quota - st.usage < 1.3e9 && st.dat < st.expect.bytes ? 'warn' : 'ok');
+  $('storages').textContent = 'origin private file system; needs about 1.1 GiB free for the snapshot and its index';
+  const full = st.dat === st.expect.bytes;
+  $('dat').textContent = st.dat < 0 ? 'absent' : full ? 'complete' : `${mib(st.dat)} of ${mib(st.expect.bytes)}`; $('dat').className = 'v ' + (full ? 'ok' : st.dat < 0 ? '' : 'warn');
+  $('dats').textContent = full ? `sha256 ${st.sha ? (st.sha === st.expect.sha256 ? 'matches' : 'MISMATCH') : 'not checked yet'}` : st.dat > 0 ? 'partial, fetch resumes' : '';
+  const hasIdx = st.idx > 0;
+  $('ver').textContent = hasIdx ? 'verified' : full ? 'not yet' : '…'; $('ver').className = 'v ' + (hasIdx ? 'ok' : '');
+  $('vers').textContent = hasIdx ? `hash_serialized_3 ${st.expect.txoutsetHash.slice(0, 16)}… recomputed from the file and matched; base ${st.expect.baseHash.slice(0, 16)}…` : 'parse the file, recompute hash_serialized_3, compare with the pinned value';
+  $('idx').textContent = hasIdx ? mib(st.idx) : 'absent'; $('idx').className = 'v ' + (hasIdx ? 'ok' : '');
+  $('idxs').textContent = hasIdx ? `${st.expect.coins.toLocaleString()} entries of 16 bytes, binary-searched by txid; the set is ready for blocks` : '';
+}
+function buttons() { $('go').disabled = busy; $('verify').disabled = busy || !(st && st.dat === st.expect.bytes); $('wipe').disabled = busy; }
+$('go').onclick = () => { const url = $('url').value.trim(); if (!url) return log('give a snapshot URL'); localStorage.setItem('snapshotUrl', url); busy = true; buttons(); log(`fetching from ${url}`); worker.postMessage(st && st.dat === st.expect.bytes ? { type: st.sha ? 'verify' : 'hash' } : { type: 'fetch', url }); };
+$('verify').onclick = () => { busy = true; buttons(); log('verifying'); worker.postMessage({ type: st.sha ? 'verify' : 'hash' }); };
+$('wipe').onclick = () => { busy = true; buttons(); worker.postMessage({ type: 'wipe' }); };
+worker.onmessage = ((inner) => (e) => { inner(e); if (e.data.type === 'fetched' && e.data.ok) { log('verifying'); worker.postMessage({ type: 'verify' }); } })(worker.onmessage);
+worker.postMessage({ type: 'status' });
+</script>

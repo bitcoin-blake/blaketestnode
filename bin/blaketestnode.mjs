@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 // blaketestnode: fetch | verify | sync | bench | run   (--data <dir>, --source http|rpc, --blocks-url <url>, --webseed <url>, --conf <bitcoin.conf>, --no-scripts, --to <height>, --api <port>, --poll <s>, --checkpoint-every <n>)
-import { readFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { CHAIN, SNAPSHOT } from '../lib/params.mjs';
-import { parseSnapshot, writeSnapshot } from '../lib/snapshot.mjs';
-import { PackedUtxo, FileBytes, buildIndex, writeIndex, readIndex } from '../lib/packed.mjs';
+import { writeSnapshot } from '../lib/snapshot-write.mjs';
+import { hasherFactory } from '../lib/sha256.mjs';
+import { PackedUtxo, buildIndex, indexBytes, parseIndexBytes } from '../lib/packed.mjs';
+import { FileBytes } from '../lib/filebytes.mjs';
 import { loadEngine } from '../lib/engine.mjs';
 import { makeRpc } from '../lib/rpc.mjs';
 import { fetchSnapshot, sha256File } from '../lib/fetch.mjs';
@@ -28,6 +30,7 @@ if (opt('--webseed')) SNAPSHOT.webseed = opt('--webseed');
 const API = Number(opt('--api', 3337)); const POLL = Number(opt('--poll', 30)); const CKPT = Number(opt('--checkpoint-every', 2016));
 const log = (...a) => console.error(new Date().toISOString().slice(11, 19), ...a);
 const bench = {};
+const newHasher = await hasherFactory();
 const mb = () => (process.memoryUsage().rss / 1048576).toFixed(0) + ' MiB rss';
 mkdirSync(DATA, { recursive: true });
 const snapPath = `${DATA}/${SNAPSHOT.file}`;
@@ -45,29 +48,26 @@ async function fetch() {
 function load({ path = snapPath, sha256 = SNAPSHOT.sha256, expect = SNAPSHOT } = {}) {
   if (!existsSync(path)) throw new Error(`no snapshot at ${path}; run fetch first`);
   const idxPath = `${path}.idx`;
+  const source = new FileBytes(path);
   let index;
   if (existsSync(idxPath)) {
     const t0 = performance.now();
-    try { index = readIndex(idxPath, sha256); bench.index = { ms: +(performance.now() - t0).toFixed(0), coins: index.count, from: 'file' }; log(`index read: ${index.count.toLocaleString()} coins in ${bench.index.ms} ms`); }
+    try { index = parseIndexBytes(new Uint8Array(readFileSync(idxPath)), sha256); bench.index = { ms: +(performance.now() - t0).toFixed(0), coins: index.count, from: 'file' }; log(`index read: ${index.count.toLocaleString()} coins in ${bench.index.ms} ms`); }
     catch (e) { log(`index unusable (${e.message}), rebuilding`); index = null; }
   }
   if (!index) {
-    let t0 = performance.now();
-    const buf = readFileSync(path);
-    bench.read = { ms: +(performance.now() - t0).toFixed(0), bytes: buf.length };
-    t0 = performance.now();
-    const r = parseSnapshot(buf, { hash: true, log });
+    const t0 = performance.now();
+    const r = buildIndex(source, { hash: true, hasher: newHasher, log });
     bench.parse = { ms: +r.ms.toFixed(0), coins: r.coinsRead, txids: r.txids, coinsPerSec: Math.round(r.coinsRead / (r.ms / 1000)), rss: mb() };
     const checks = { magic: true, network: r.networkMagic === CHAIN.networkMagic, baseHash: r.baseHash === (expect.baseHash ?? expect.base_hash), coins: r.coinsRead === expect.coins, hashSerialized: r.hashSerialized === (expect.txoutsetHash ?? expect.txoutset_hash) };
     bench.snapshot = { ...checks, baseHash: r.baseHash, hashSerialized: r.hashSerialized };
     if (Object.values(checks).includes(false)) throw new Error(`snapshot check failed: ${JSON.stringify(checks)} got ${r.hashSerialized}`);
-    log(`snapshot ok: ${r.coinsRead.toLocaleString()} coins in ${r.txids.toLocaleString()} txids, hash_serialized_3 matches, ${(r.ms / 1000).toFixed(1)} s`);
-    t0 = performance.now();
-    const built = buildIndex(buf); writeIndex(idxPath, built, sha256); index = { entries: built.entries, count: built.count };
-    bench.index = { ms: +(performance.now() - t0).toFixed(0), coins: built.count, from: 'built', bytes: built.entries.length };
-    log(`index built: ${built.count.toLocaleString()} entries, ${(built.entries.length / 1048576).toFixed(0)} MiB, ${bench.index.ms} ms, ${mb()}`);
+    log(`snapshot ok: ${r.coinsRead.toLocaleString()} coins in ${r.txids.toLocaleString()} txids, hash_serialized_3 matches; index built, ${(r.ms / 1000).toFixed(1)} s, ${mb()}`);
+    writeFileSync(idxPath, indexBytes({ entries: r.entries, count: r.count, baseHash: r.baseHash }, sha256));
+    index = { entries: r.entries, count: r.count };
+    bench.index = { ms: +(performance.now() - t0).toFixed(0), coins: r.count, from: 'built', bytes: r.entries.length };
   }
-  const utxo = new PackedUtxo(new FileBytes(path), index);
+  const utxo = new PackedUtxo(source, index);
   log(`utxo set: ${utxo.size.toLocaleString()} coins, ${mb()}`);
   return utxo;
 }

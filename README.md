@@ -63,6 +63,18 @@ Options: `--data <dir>` (default `~/.blaketestnode/txbt4`), `--source http|rpc`,
 takes seconds; building the index for a new snapshot takes about 20 s. The engine is loaded from `$SCHEMA` or
 `~/bitcoin-desktop/schema`; it needs bitcoin-desktop/schema v0.0.27 or later (unified sighash, pay-to-anchor).
 
+## In the browser
+
+`browser/index.html` is the same node starting in a tab: it fetches the snapshot into the
+origin's private file system in parallel ranges (resumable, a journal of finished ranges),
+hashes it, then a module worker runs the same parser and index builder over the file
+through a sync access handle and keeps the 217 MB index beside it. Nothing leaves the tab
+and no server is trusted: the pinned sha256 and `hash_serialized_3` decide. Give it a
+snapshot URL with `?snapshot=` (a plain file with Range and CORS). Measured in Chromium
+on this machine: fetch 2 s from a local server, sha256 15 s, parse plus index 37 s.
+Storage needed is about 1.1 GB; the page shows the origin's quota first. Blocks and
+validation in the tab are the next step.
+
 ## Snapshot
 
 | | |
@@ -99,9 +111,12 @@ validates with scripts on. Signature checks are about 48 of the 51 s, pure-JS se
 - `lib/snapshot.mjs` snapshot parser and `hash_serialized_3`
 - `lib/packed.mjs` the UTXO set: a packed index of the snapshot (16 bytes per coin, file
   order, binary search on a txid prefix with the full txid checked in the file), a spent
-  bitmap, and a side map of new coins; built once in 3 s, read back in 50 ms, 230 MB
+  bitmap, and a side map of new coins; built in one pass with the hash, read back in 50 ms
 - `lib/delta.mjs` per-block deltas appended after each block and replayed on restart
-- `lib/utxo.mjs` the earlier string-keyed map, kept for reference
+- `lib/bytes.mjs`, `lib/sha256.mjs` byte helpers and an incremental SHA-256, so the parser
+  and index run unchanged in Node and in a worker
+- `lib/snapshot-write.mjs`, `lib/filebytes.mjs` the Node-only writer and file access
+- `browser/index.html`, `browser/worker.js` the page and its worker
 - `lib/fetch.mjs` WebTorrent fetch and sha256
 - `lib/blockfile.mjs`, `lib/source.mjs` the block file format and the http/rpc block sources
 - `lib/nip333.mjs` the chain tip from NIP-333 header events, one-shot and live
