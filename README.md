@@ -117,7 +117,11 @@ header, the coinbase and the merkle path, so the coordinator rebuilds the commit
 block this miner built. `lib/open.mjs` opens a daemon's state read-only in another process.
 `node test/webminer-test.mjs` runs it against a standalone datstr coordinator on the live chain:
 the share for height 151,413 was verified by SPEC 8.1 and credited (#1); a coinbase paying the
-wrong script was refused as `split`.
+wrong script was refused as `split`. In the tab, the "mine" card does the same with hashing
+workers (the datstr miner's core from jsDelivr, WebAssembly): a Chromium tab that had replayed its
+own delta log to the tip in 1.5 s connected to a coordinator as its own master, built block
+151,413 with the coordinator's split, and had 2,072 shares credited in a minute, none refused,
+vardiff raising its difficulty from 0.0001 to 0.0016 on the way.
 
 ## Snapshot
 
