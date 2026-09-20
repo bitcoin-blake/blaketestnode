@@ -121,7 +121,12 @@ wrong script was refused as `split`. In the tab, the "mine" card does the same w
 workers (the datstr miner's core from jsDelivr, WebAssembly): a Chromium tab that had replayed its
 own delta log to the tip in 1.5 s connected to a coordinator as its own master, built block
 151,413 with the coordinator's split, and had 2,072 shares credited in a minute, none refused,
-vardiff raising its difficulty from 0.0001 to 0.0016 on the way.
+vardiff raising its difficulty from 0.0001 to 0.0016 on the way. Against the live pool's
+coordinator (start difficulty 1,000) the same tab, hashing at about 100 MH/s, found nothing for
+minutes: at that rate the 32-bit nonce space is exhausted in 42 seconds and a piece of work at a
+real difficulty rarely holds a valid nonce at all. The hashers now roll the second nonce word
+(`header.nonce2`, bytes 36..39 of the work) on every wrap, as a rig rolls its extranonce, and the
+share carries it; after that the live coordinator credited the tab's shares (#145,218 onward).
 
 ## Snapshot
 
