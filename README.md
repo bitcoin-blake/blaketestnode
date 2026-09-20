@@ -127,6 +127,10 @@ minutes: at that rate the 32-bit nonce space is exhausted in 42 seconds and a pi
 real difficulty rarely holds a valid nonce at all. The hashers now roll the second nonce word
 (`header.nonce2`, bytes 36..39 of the work) on every wrap, as a rig rolls its extranonce, and the
 share carries it; after that the live coordinator credited the tab's shares (#145,218 onward).
+Manners: a share must be at the assignment's target (SPEC 8.1), so a tab given a low one cannot
+raise it; it sends at most `maxSharesPerSecond` (10) and drops the rest, counted on the page,
+until the pool's vardiff raises its difficulty. A block is never dropped. `node
+test/manners-test.mjs` covers it with a fake socket and clock.
 
 ## Snapshot
 

@@ -132,7 +132,7 @@ async function minerDeps() { const { k, hash } = await loadEngine(); const [pow,
 async function startMining({ url, key, pay }) {
   if (!chain.node) throw new Error('sync first'); if (chain.miner) chain.miner.close();
   const deps = await minerDeps(); const wm = makeWebMiner({ ...deps, node: chain.node, mempool: chain.mempool, key, payScript: pay, chain: CHAIN.network, url, log });
-  chain.miner = wm; wm.on((m) => { if (m.type === 'assignment' || m.type === 'split') newWork('the pool sent ' + m.type); if (m.type === 'ack') post({ ...m, type: 'mine-ack', sent: wm.state.sent, acked: wm.state.acked, refused: wm.state.refused, blocks: wm.state.blocksFound }); });
+  chain.miner = wm; wm.on((m) => { if (m.type === 'assignment' || m.type === 'split') newWork('the pool sent ' + m.type); if (m.type === 'ack') post({ ...m, type: 'mine-ack', sent: wm.state.sent, acked: wm.state.acked, refused: wm.state.refused, dropped: wm.state.dropped, blocks: wm.state.blocksFound }); });
   post({ type: 'mining', pub: wm.pub, url }); newWork('start');
 }
 function newWork(why) {
@@ -143,7 +143,7 @@ function newWork(why) {
 function foundNonce({ jobKey, nonce, nonce2 = 0 }) {
   const wm = chain.miner, job = chain.job; if (!wm || !job || jobKey !== chain.jobKey) return;
   const sh = wm.share(job, nonce, nonce2); if (!sh.ok) return post({ type: 'log', text: `share not sent: ${sh.reason}` });
-  const sent = wm.send(sh.event); post({ type: 'share', hash: sh.hash, height: job.height, isBlock: sh.isBlock, sent, sentTotal: wm.state.sent });
+  const sent = wm.send(sh.event, { isBlock: sh.isBlock }); post({ type: 'share', hash: sh.hash, height: job.height, isBlock: sh.isBlock, sent, sentTotal: wm.state.sent, dropped: wm.state.dropped });
   if (sh.isBlock) post({ type: 'log', text: `BLOCK ${sh.hash} at ${job.height}: in the share; a verifier with a node submits it` });
 }
 async function loadSet() {
