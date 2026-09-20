@@ -107,6 +107,18 @@ signatures (22 s) on its own, with no server trusted. `node test/template-test.m
 covers a throwaway chain and checks the datstr gateway's builder makes the identical block from the
 same template.
 
+## Mining what it built (datstr SPEC 6.3 and 8)
+
+`lib/webminer.mjs` makes the node a datstr gateway of one: it is its own master (a miner
+descriptor paying its script), speaks the coordinator's socket (hello, welcome, split,
+assignment, ack), builds each height's block with `lib/template.mjs` and the coordinator's split,
+hashes the 80-byte work an ASIC would (`workBytes`), and signs the kind 23400 share carrying the
+header, the coinbase and the merkle path, so the coordinator rebuilds the commitment from the
+block this miner built. `lib/open.mjs` opens a daemon's state read-only in another process.
+`node test/webminer-test.mjs` runs it against a standalone datstr coordinator on the live chain:
+the share for height 151,413 was verified by SPEC 8.1 and credited (#1); a coinbase paying the
+wrong script was refused as `split`.
+
 ## Snapshot
 
 | | |
