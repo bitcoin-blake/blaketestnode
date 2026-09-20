@@ -82,6 +82,16 @@ delta log so a reload replays in seconds, then follows the tip every 30 s and on
 NIP-333 event. Measured in Chromium: 797 blocks validated in 48 s, replay 9 s, a new
 block applied live. A coin lookup box answers from the tab's own set.
 
+## Mempool (datstr SPEC 6.3)
+
+With `--mempool-relays wss://a,wss://b` the daemon follows kind 23404 events (one transaction
+each, `chain` tag = this chain; a datstr gateway publishes its node's mempool that way) and
+validates every one against its own UTXO set before holding it: structure, inputs unspent and
+mature, value, scripts with the chain's sighash, a fee floor. What passes is served at
+`/mempool` and `/mempool/<txid>` and dropped when a block confirms or conflicts with it.
+`--mempool-publishers pk,pk` limits the publishers. `node test/mempool-test.mjs` runs both ends
+through a local relay (it imports the gateway's publisher from `$DATSTR_GATEWAY`).
+
 ## Snapshot
 
 | | |

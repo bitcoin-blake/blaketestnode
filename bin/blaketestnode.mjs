@@ -15,6 +15,7 @@ import { fetchTip, subscribeTip } from '../lib/nip333.mjs';
 import { ChainNode } from '../lib/node.mjs';
 import { listStates, saveState } from '../lib/state.mjs';
 import { startApi } from '../lib/api.mjs';
+import { Mempool, subscribeMempool } from '../lib/mempool.mjs';
 import { DeltaLog, applyDelta } from '../lib/delta.mjs';
 
 const argv = process.argv.slice(2);
@@ -183,10 +184,14 @@ async function run() {
   const startedAt = Date.now();
   const st = { state: 'starting', nostr: null, file: null, checkpoint: null, saving: false, lastTickAt: null, rollbacks: 0, startedFrom: null, tipTime: null };
   let node = null, utxo = null, api = null;
-  const status = () => ({ network: CHAIN.network, alias: CHAIN.alias, height: node?.height ?? -1, hash: node?.tipHash() ?? null, tipTime: st.tipTime, coins: utxo?.size ?? 0, state: st.state, saving: st.saving,
+  const status = () => ({ network: CHAIN.network, alias: CHAIN.alias, height: node?.height ?? -1, mempool: mempool ? { count: mempool.size, ...mempool.stats } : null, hash: node?.tipHash() ?? null, tipTime: st.tipTime, coins: utxo?.size ?? 0, state: st.state, saving: st.saving,
     checkpoint: st.checkpoint, deltas: node ? deltas?.length ?? 0 : 0, nostr: st.nostr, file: st.file, lastTickAt: st.lastTickAt, uptimeS: Math.floor((Date.now() - startedAt) / 1000), rssMiB: Math.round(process.memoryUsage().rss / 1048576),
     run: node ? { blocks: node.stats.blocks, txs: node.stats.txs, validateMs: Math.round(node.stats.validateMs), failed: node.stats.failed, rollbacks: st.rollbacks, startedFrom: st.startedFrom, skipped: node.stats.skipped } : { blocks: 0, txs: 0, validateMs: 0, failed: 0, rollbacks: 0, startedFrom: st.startedFrom } });
-  api = await startApi({ port: API, status, node: () => node, source, k, log }); // before the long load, so a port clash fails fast
+  // datstr SPEC 6.3: --mempool-relays wss://a,wss://b follows kind 23404 events and validates each transaction here
+  const MEMPOOL_RELAYS = String(opt('--mempool-relays') ?? process.env.BLAKETESTNODE_MEMPOOL_RELAYS ?? '').split(',').map((x) => x.trim()).filter(Boolean);
+  const PUBLISHERS = String(opt('--mempool-publishers') ?? '').split(',').map((x) => x.trim()).filter(Boolean);
+  let mempool = null;
+  api = await startApi({ port: API, status, node: () => node, source, k, mempool: null, log }); // before the long load, so a port clash fails fast
   let file = await source.update(); st.file = { ...file, blocks: source.index.blocks.length, at: Math.floor(Date.now() / 1000) };
   const ctx = await source.contextHeaders(CHAIN.blocksUrl.replace(/-blocks$/, '-context-headers.json'));
   const magic = CHAIN.networkMagic;
@@ -210,6 +215,7 @@ async function run() {
   }
   if (replayed) log(`replayed ${replayed} delta(s) to ${base.height}`);
   node = new ChainNode({ k, utxo, epochStart, log });
+  if (MEMPOOL_RELAYS.length) { mempool = new Mempool({ k, node, network: CHAIN.network, log }); api.mempool = mempool; await subscribeMempool(mempool, { relays: MEMPOOL_RELAYS, network: CHAIN.network, publishers: PUBLISHERS.length ? PUBLISHERS : null, log }); }
   node.loadContext(ctx.headers.map((h) => k.codec.decode('BlockHeader', h)));
   node.setBase(base.height, base.hash);
   // headers between the base and the checkpoint are needed for MTP and difficulty context
@@ -245,7 +251,7 @@ async function run() {
       for (let h = node.height + 1; h <= to; h++) {
         const r = node.applyNext(h, await source.blockHex(h));
         const u = node.undo.at(-1); deltas.append({ height: h, hash: r.hash, spent: u.spent.map(([key]) => key), created: u.created.map((key) => [key, utxo.get(key)]).filter(([, c]) => c) }); // a coin spent in its own block is gone already
-        st.tipTime = r.time; sinceSave++; dirty = false;
+        st.tipTime = r.time; sinceSave++; dirty = false; mempool?.afterBlock();
         api?.broadcast({ type: 'block', height: h, hash: r.hash, txs: r.txs, time: r.time });
         if (h % 50 === 0 || h === to) log(`block ${h} ${r.hash.slice(0, 16)}… ${r.txs} txs${h === to ? ' (tip)' : ''}`);
       }
