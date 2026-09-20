@@ -16,6 +16,8 @@ import { ChainNode } from '../lib/node.mjs';
 import { listStates, saveState } from '../lib/state.mjs';
 import { startApi } from '../lib/api.mjs';
 import { Mempool, subscribeMempool } from '../lib/mempool.mjs';
+import { buildTemplate, checkTemplate } from '../lib/template.mjs';
+import { SCHEMA } from '../lib/engine.mjs';
 import { DeltaLog, applyDelta } from '../lib/delta.mjs';
 
 const argv = process.argv.slice(2);
@@ -215,6 +217,8 @@ async function run() {
   }
   if (replayed) log(`replayed ${replayed} delta(s) to ${base.height}`);
   node = new ChainNode({ k, utxo, epochStart, log });
+  const hashLib = await import(`${SCHEMA}/codec/hash.js`);
+  api.template = (payScripts, worker) => { const b = buildTemplate({ k, hash: hashLib, node, mempool, payScripts, worker }); const c = checkTemplate({ k, node, block: b.block, height: b.height }); return { height: b.height, hash: b.hash, prevHash: b.prevHash, time: b.time, mtp: b.mtp, bits: b.bits.toString(16), rdts: b.rdtsActive, txs: b.txids.length, txids: b.txids, fees: b.fees, value: b.value, weight: b.weight, cbTxid: b.cbTxid, commitment: b.commitment, checks: c, hex: b.hex, template: b.template }; };
   if (MEMPOOL_RELAYS.length) { mempool = new Mempool({ k, node, network: CHAIN.network, log }); api.mempool = mempool; await subscribeMempool(mempool, { relays: MEMPOOL_RELAYS, network: CHAIN.network, publishers: PUBLISHERS.length ? PUBLISHERS : null, log }); }
   node.loadContext(ctx.headers.map((h) => k.codec.decode('BlockHeader', h)));
   node.setBase(base.height, base.hash);

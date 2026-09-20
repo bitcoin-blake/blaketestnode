@@ -7,16 +7,18 @@ import { bytesToHex } from '../lib/bytes.mjs';
 import { PackedUtxo } from '../lib/packed.mjs';
 import { ChainNode } from '../lib/node.mjs';
 import { fetchTip, subscribeTip } from '../lib/nip333.mjs';
+import { buildTemplate, checkTemplate } from '../lib/template.mjs';
+import { Mempool, subscribeMempool } from '../lib/mempool.mjs';
 import { OpfsBlockSource } from './blocks.js';
 
 const CDN = 'https://cdn.jsdelivr.net/gh/bitcoin-desktop/schema@v0.0.27';
 let engine = null;
 async function loadEngine() {
   if (engine) return engine;
-  const [{ createKernel }, { knotsBlake2b }, nostr] = await Promise.all([import(`${CDN}/codec/kernel.js`), import(`${CDN}/codec/overlays/knots-blake2b.js`), import(`${CDN}/codec/nostr.js`)]);
+  const [{ createKernel }, { knotsBlake2b }, nostr, hash] = await Promise.all([import(`${CDN}/codec/kernel.js`), import(`${CDN}/codec/overlays/knots-blake2b.js`), import(`${CDN}/codec/nostr.js`), import(`${CDN}/codec/hash.js`)]);
   const j = async (p) => (await fetch(`${CDN}/${p}`)).json();
   const k = createKernel({ core: await j('schema/core.jsonld'), proof: await j('schema/proof.jsonld'), script: await j('schema/script.jsonld'), chain: await j('schema/chain.jsonld'), validate: await j('schema/validate.jsonld'), network: CHAIN.network, overlays: [knotsBlake2b(await j('schema/overlays/knots-blake2b.jsonld'))] });
-  return (engine = { k, nostr });
+  return (engine = { k, nostr, hash });
 }
 // small-file helpers over OPFS for the block mirror
 const files = {
@@ -122,7 +124,7 @@ async function verify() {
 async function wipe() { const d = await dir(); for (const n of [SNAPSHOT.file, `${SNAPSHOT.file}.idx`, `${SNAPSHOT.file}.sha256`, `${SNAPSHOT.file}.ranges`]) { try { await d.removeEntry(n); } catch {} } }
 
 // ---- the chain: blocks from the served file, tip from the relays, validation against the set ----
-const chain = { node: null, utxo: null, source: null, bytes: null, nostr: null, deltas: [], syncing: false, timer: null, blocksUrl: null };
+const chain = { node: null, utxo: null, source: null, bytes: null, nostr: null, deltas: [], syncing: false, timer: null, blocksUrl: null, mempool: null, mempoolSub: null };
 async function loadSet() {
   if (chain.utxo) return chain.utxo;
   const ih = await open(`${SNAPSHOT.file}.idx`); const ib = new Uint8Array(ih.getSize()); ih.read(ib, { at: 0 }); ih.close();
@@ -187,6 +189,7 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
       if (applied % 20 === 0 || h === to) post({ type: 'progress', height: h, to, applied, txs, ms: performance.now() - t0, coins: utxo.size });
     }
     if (applied) await writeSmall('deltas.json', JSON.stringify(chain.deltas));
+    if (applied) chain.mempool?.afterBlock();
     post({ type: 'synced', height: chain.node.height, hash: chain.node.tipHash(), time: chain.node.headers[chain.node.height]?.time ?? null, coins: utxo.size, applied, txs, ms: performance.now() - t0, stats: chain.node.stats, scripts: !noScripts, quiet: applied === 0 && !!chain.timer });
     if (!chain.timer) {
       chain.timer = setInterval(() => enqueue(() => withSnapshot(() => sync(chain.blocksUrl, { noScripts }))), 30_000);
@@ -217,6 +220,13 @@ async function handle(m) {
       post({ type: 'debug', key: m.key, hasUtxo: !!u, fresh: u?.fresh.size, freshHas: u?.fresh.has(m.key), get: c, classify: cl, err, height: chain.node?.height, deltas: chain.deltas.length });
     });
     else if (m.type === 'coin') await withSnapshot(() => coin(m.key));
+    else if (m.type === 'mempool') { // datstr SPEC 6.3: transactions from relays, validated here
+      const { k, nostr } = await loadEngine(); if (!chain.node) throw new Error('sync first'); if (chain.mempoolSub) chain.mempoolSub.close();
+      chain.mempool = new Mempool({ k, node: chain.node, network: CHAIN.network, log }); chain.mempoolSub = await subscribeMempool(chain.mempool, { relays: m.relays, network: CHAIN.network, nostr, log }); post({ type: 'mempool', count: 0, relays: m.relays }); }
+    else if (m.type === 'template') await withSnapshot(async () => { // the block this tab builds for itself
+      const { k, hash } = await loadEngine(); if (!chain.node) throw new Error('sync first');
+      const b = buildTemplate({ k, hash, node: chain.node, mempool: chain.mempool, payScripts: [m.pay], worker: m.worker }); const c = checkTemplate({ k, node: chain.node, block: b.block, height: b.height });
+      post({ type: 'template', height: b.height, hash: b.hash, prevHash: b.prevHash, time: b.time, bits: b.bits.toString(16), rdts: b.rdtsActive, txs: b.txids.length, fees: b.fees, value: b.value, weight: b.weight, cbTxid: b.cbTxid, commitment: b.commitment, checks: c, hex: b.hex, mempool: chain.mempool ? { count: chain.mempool.size, ...chain.mempool.stats } : null }); });
     else if (m.type === 'status') await status();
     else if (m.type === 'fetch') { await fetchSnapshot(m.url); await status(); }
     else if (m.type === 'hash') { const hex = await hashFile(); post({ type: 'fetched', bytes: await sizeOf(SNAPSHOT.file), ms: 0, sha256: hex, ok: hex === SNAPSHOT.sha256 }); await status(); }

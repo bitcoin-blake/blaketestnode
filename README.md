@@ -92,6 +92,19 @@ mature, value, scripts with the chain's sighash, a fee floor. What passes is ser
 `--mempool-publishers pk,pk` limits the publishers. `node test/mempool-test.mjs` runs both ends
 through a local relay (it imports the gateway's publisher from `$DATSTR_GATEWAY`).
 
+## The block it builds (datstr SPEC 6.3)
+
+`lib/template.mjs` builds the next block from the node's own state: time after the median time
+past, bits from the chain's rules, transactions from the mempool by fee rate within the weight
+limit (the RDTS 800,000 while it is active), the coinbase as datstr SPEC 6.1 has it (the split or
+the pay scripts, the witness commitment, the datstr commitment output last), the merkle root and a
+v2 header. `checkTemplate` then runs every kernel rule on it; the only one an unmined block may
+fail is proof of work. The daemon serves it at `/template?pay=<script hex>`; the tab has a "build a
+block" button. Proven against Knots: a block built by the daemon for height 151,412 was accepted by
+both a 29.4.1 and a 29.4.2rc2 node in `getblocktemplate` proposal mode. `node test/template-test.mjs`
+covers a throwaway chain and checks the datstr gateway's builder makes the identical block from the
+same template.
+
 ## Snapshot
 
 | | |
