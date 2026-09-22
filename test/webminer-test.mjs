@@ -7,7 +7,7 @@
 import { spawn } from 'node:child_process'; import { homedir, tmpdir } from 'node:os'; import { mkdtempSync } from 'node:fs'; import { join } from 'node:path';
 import { openNode } from '../lib/open.mjs'; import { makeWebMiner, meets } from '../lib/webminer.mjs'; import { loadEngine, SCHEMA } from '../lib/engine.mjs'; import { CHAIN } from '../lib/params.mjs';
 const H = homedir(); const GW = process.env.DATSTR_GATEWAY ?? `${H}/ideas/datstr-wt-mempool/gateway`; const DATSTR = `${GW}/..`;
-const CONF = process.env.BITCOIN_CONF ?? `${H}/knots-testnet4/bitcoin.conf`; const DATA = process.env.BLAKETESTNODE_DATA ?? `${H}/.blaketestnode/txbt4`; const BLOCKS = process.env.BLAKETESTNODE_BLOCKS_URL ?? 'https://melvin.me/public/txbt4/txbt4-blocks';
+const CONF = process.env.BITCOIN_CONF ?? `${H}/knots-testnet4/bitcoin.conf`; const DATA = process.env.BLAKETESTNODE_DATA ?? `${H}/.blaketestnode/txbt4`; const BLOCKS = process.env.BLAKETESTNODE_BLOCKS_URL; // a blocks mirror for the chain under test; no default, set it for your own
 let ok = 0, bad = 0; const t = (name, cond) => { console.log(`  ${cond ? 'PASS' : 'FAIL'}  ${name}`); cond ? ok++ : bad++; };
 const log = (...a) => console.log('   ', ...a);
 const k = await loadEngine(CHAIN.network); const hash = await import(`${SCHEMA}/codec/hash.js`); const pow = await import(`${SCHEMA}/codec/pow/knots-header-v2.js`); const { blake2b } = await import(`${SCHEMA}/codec/pow/blake2b.js`);
@@ -18,6 +18,7 @@ const co = spawn(process.execPath, [`${DATSTR}/plugin/standalone.mjs`, '--conf',
 let colog = ''; co.stdout.on('data', (d) => { colog += d; }); co.stderr.on('data', (d) => { colog += d; }); process.on('exit', () => co.kill());
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 for (let i = 0; i < 60 && !/coordinator: ws/.test(colog); i++) await sleep(500); t('a standalone coordinator is up on the same chain', /coordinator: ws/.test(colog));
+if (!BLOCKS) { console.log('set BLAKETESTNODE_BLOCKS_URL to a blocks mirror for the chain under test'); process.exit(1); }
 const { node, sync } = await openNode({ k, data: DATA, blocksUrl: BLOCKS, scratch: `${tmp}/src`, log });
 t('this process is a web node at the served tip', node.height > 151000 && node.utxo.size > 14000000);
 const key = signer.randomKey(); const payScript = '5120' + signer.pubkeyOf(signer.randomKey());
