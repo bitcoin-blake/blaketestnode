@@ -38,7 +38,8 @@ const dir = async () => (root ??= await navigator.storage.getDirectory());
 async function open(name, create = false) {
   const fh = await (await dir()).getFileHandle(name, { create });
   for (let attempt = 0; ; attempt++) {
-    try { return await fh.createSyncAccessHandle(); }
+    // a read is opened read-only where the browser allows it, so a page can hold the snapshot open as well (to seed it); a write takes the exclusive handle
+    try { return create ? await fh.createSyncAccessHandle() : await fh.createSyncAccessHandle({ mode: 'read-only' }); }
     catch (e) { if (attempt >= 24 || !/Access Handle/.test(e.message)) throw new Error(attempt >= 24 ? `${name} is open in another tab of this site; close it and retry` : e.message); await new Promise((r) => setTimeout(r, 250)); }
   }
 }
