@@ -246,6 +246,10 @@ async function handle(m) {
       const height = m.hash ? [...chain.source.byHeight.values()].find((e) => e.hash === String(m.hash).toLowerCase())?.height : Number(m.height); const e = height != null && !Number.isNaN(height) ? chain.source.byHeight.get(height) : null; if (!e) throw new Error('Block not found');
       const block = k.codec.decode('Block', await chain.source.blockHex(height)); const txids = block.transactions.map((tx) => k.codec.txid(tx));
       post({ type: 'block', height, hash: e.hash, size: e.size, header: block.header, nTx: txids.length, txids, previousblockhash: block.header.prevBlockHash, nextblockhash: chain.source.byHeight.get(height + 1)?.hash ?? null, confirmations: chain.node ? chain.node.height - height + 1 : null, req: m.req ?? null }); });
+    else if (m.type === 'coins') await withSnapshot(async () => { // the unspent coins paying a script, among those created since the snapshot (a page wallet's balance)
+      if (!chain.utxo) throw new Error('sync first'); const want = String(m.script).toLowerCase(); const out = [];
+      for (const [key, c] of chain.utxo.fresh) if (c?.output?.scriptPubKey === want) out.push({ key, value: c.output.value, height: c.height, coinbase: !!c.coinbase });
+      post({ type: 'coins', script: want, height: chain.node?.height ?? null, coins: out, note: 'coins from before the snapshot are not scanned (the index is by txid)' }); });
     else if (m.type === 'coin') await withSnapshot(() => coin(m.key));
     else if (m.type === 'mempool') { // datstr SPEC 6.3: transactions from relays, validated here
       const { k, nostr } = await loadEngine(); if (!chain.node) throw new Error('sync first'); if (chain.mempoolSub) chain.mempoolSub.close();
