@@ -248,7 +248,12 @@ async function handle(m) {
       post({ type: 'block', height, hash: e.hash, size: e.size, header: block.header, nTx: txids.length, txids, previousblockhash: block.header.prevBlockHash, nextblockhash: chain.source.byHeight.get(height + 1)?.hash ?? null, confirmations: chain.node ? chain.node.height - height + 1 : null, req: m.req ?? null }); });
     else if (m.type === 'coins') await withSnapshot(async () => { // the unspent coins paying a script, among those created since the snapshot (a page wallet's balance)
       if (!chain.utxo) throw new Error('sync first'); const want = String(m.script).toLowerCase(); const out = [];
-      for (const [key, c] of chain.utxo.fresh) if (c?.output?.scriptPubKey === want) out.push({ key, value: c.output.value, height: c.height, coinbase: !!c.coinbase });
+      for (const [key, c] of chain.utxo.fresh) if (c?.output?.scriptPubKey === want) out.push({ key, value: c.output.value, height: c.height, coinbase: !!c.coinbase, inputs: [] });
+      // the prevouts each coin's transaction spent, so a wallet can tell its own change from a receipt
+      const { k } = await loadEngine(); const blocks = new Map();
+      for (const c of out) { if (c.coinbase) continue; const txid = c.key.slice(0, c.key.indexOf(':'));
+        if (!blocks.has(c.height)) blocks.set(c.height, chain.source?.byHeight?.get(c.height) ? k.codec.decode('Block', await chain.source.blockHex(c.height)).transactions : []);
+        const tx = blocks.get(c.height).find((t) => k.codec.txid(t) === txid); if (tx) c.inputs = tx.inputs.map((i) => `${i.prevout.txid}:${i.prevout.vout}`); }
       post({ type: 'coins', script: want, height: chain.node?.height ?? null, coins: out, note: 'coins from before the snapshot are not scanned (the index is by txid)' }); });
     else if (m.type === 'coin') await withSnapshot(() => coin(m.key));
     else if (m.type === 'mempool') { // datstr SPEC 6.3: transactions from relays, validated here
