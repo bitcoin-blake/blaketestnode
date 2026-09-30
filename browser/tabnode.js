@@ -100,9 +100,13 @@ export function createTabNode({ base, snapshotUrl, blocksUrl, torrent = false, s
     else if (m.type === 'log') { log(m.text); }
     if (m.type !== 'log') emit(m.type, m); emit('message', m); } // 'log' is the loader's own event above, so a worker log line is not delivered twice
 
-  async function start() { const src = await (await fetch(`${base}/browser/worker.js`)).text(); const w = src.replace(/from '\.\.\/lib\//g, `from '${base}/lib/`).replace(/from '\.\/blocks\.js'/g, `from '${base}/browser/blocks.js'`);
+  // one node per browser for every app of this origin (Reef, Bight, Winch, Hitch share its files): a second tab stays idle
+  // and says so; start() resolves false then. The lock is held for the life of the page.
+  async function start() { if (navigator.locks && opts.lock !== false) { const got = await new Promise((res) => navigator.locks.request('bitcoin-blake:node', { ifAvailable: true }, (lock) => { res(!!lock); return lock ? new Promise(() => {}) : undefined; }).catch(() => res(true))); if (!got) { node.busy = true; node.phase = 'busy'; sync('idle: the node runs in another tab of this browser (Reef, Bight, Winch or Hitch)', null); emit('busy', {}); return false; } }
+    return startWorker(); }
+  async function startWorker() { const src = await (await fetch(`${base}/browser/worker.js`)).text(); const w = src.replace(/from '\.\.\/lib\//g, `from '${base}/lib/`).replace(/from '\.\/blocks\.js'/g, `from '${base}/browser/blocks.js'`);
     worker = new Worker(URL.createObjectURL(new Blob([w], { type: 'text/javascript' })), { type: 'module' }); worker.onmessage = onMessage; worker.onerror = (e) => { node.error = e.message || 'worker failed'; sync('Error: ' + node.error, null); log('worker error: ' + node.error, 'err'); };
-    sync('Starting the node…', null); log('loading the node from ' + base.replace('https://cdn.jsdelivr.net/gh/', '')); post({ type: 'status' }); }
+    sync('Starting the node…', null); log('loading the node from ' + base.replace('https://cdn.jsdelivr.net/gh/', '')); post({ type: 'status' }); return true; }
 
   return { node, opts, on, emit, start, post, startSync, fileReady, seedStart, seedStop,
     get swarm() { return swarm; }, get seeding() { return seeding; },

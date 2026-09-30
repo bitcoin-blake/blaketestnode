@@ -13,7 +13,7 @@ const SIDESTR = 'https://cdn.jsdelivr.net/gh/sidestr/spec@cec654b7d06907130700fe
 import { Mempool, subscribeMempool } from '../lib/mempool.mjs';
 import { OpfsBlockSource } from './blocks.js';
 
-const CDN = 'https://cdn.jsdelivr.net/gh/bitcoin-desktop/schema@v0.0.27';
+const CDN = 'https://cdn.jsdelivr.net/gh/bitcoin-desktop/schema@b8cbf6337c7450fe14ddc5bce00c7280059aab5d'; // v0.0.27, pinned by commit: a tag can move
 let engine = null;
 async function loadEngine() {
   if (engine) return engine;
@@ -287,7 +287,7 @@ async function handle(m) {
       post({ type: 'tx', txid: m.txid, height: Number(m.height), found: !!tx, hex: tx ? k.codec.encodeHex('Transaction', tx) : null, req: m.req ?? null }); });
     else if (m.type === 'mempool') { // datstr SPEC 6.3: transactions from relays, validated here; a seed file from the mirror fills it on start
       const { k, nostr } = await loadEngine(); if (!chain.node) throw new Error('sync first'); if (chain.mempoolSub) chain.mempoolSub.close();
-      const mp = new Mempool({ k, node: chain.node, network: CHAIN.network, log, onChange: () => postMempool() }); chain.mempool = mp;
+      const mp = new Mempool({ k, node: chain.node, network: CHAIN.network, log, onChange: () => postMempool(), onRefuse: (r, tx) => { if (tx && (tx.inputs.some((i) => watch.outpoints.has(`${i.prevout.txid}:${i.prevout.vout}`)) || tx.outputs.some((o) => watch.scripts.has(o.scriptPubKey)))) post({ type: 'refused', txid: r.txid, error: r.error }); } }); chain.mempool = mp;
       // a check reads the UTXO set, which needs the snapshot attached: adds from the relays are queued as jobs like everything else
       const rawAdd = mp.add.bind(mp); mp.add = (hex, from) => { enqueue(() => withSnapshot(() => { rawAdd(hex, from); })); return { ok: true, queued: true }; };
       chain.mempoolSub = await subscribeMempool(mp, { relays: m.relays, network: CHAIN.network, nostr, also: m.also ?? [], log });
