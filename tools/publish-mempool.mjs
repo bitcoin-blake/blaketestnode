@@ -36,10 +36,10 @@ async function once() {
     if (!published.has(txid)) {
       let hex; try { hex = await rpc('getrawtransaction', txid); } catch (err) { continue; } // gone between the two calls
       const entry = { hex, fee: Math.round((e.fees?.base ?? e.fee ?? 0) * 1e8), vsize: e.vsize, time: e.time };
+      published.set(txid, entry); // before the publish, so a slow relay cannot make the next pass publish it again
       const event = events.signEvent(key, { kind: MEMPOOL_KIND, tags: [['chain', CHAIN.network], ['txid', txid]], content: hex });
       const r = await publish({ relays: RELAYS, event }); const ok = Object.values(r).filter((x) => x === 'ok').length;
       log(`${txid.slice(0, 16)}… ${entry.vsize} vB ${entry.fee} sat → ${ok}/${RELAYS.length} relays${ok ? '' : ' ' + JSON.stringify(r)}`);
-      published.set(txid, entry);
     }
     now.push(txid);
   }
@@ -48,5 +48,6 @@ async function once() {
   const json = JSON.stringify({ network: CHAIN.network, height, time: Math.floor(Date.now() / 1000), txs: now.map((txid) => ({ txid, ...published.get(txid) })) });
   if (json !== lastJson) { lastJson = json; await writeFile(file, json); if (RSYNC) await new Promise((resolve) => execFile('rsync', ['-a', file, RSYNC], (e) => { if (e) log(`rsync: ${e.message}`); resolve(); })); }
 }
-await once();
-setInterval(() => once().catch((e) => log('error:', e.message)), LOOP * 1000);
+let running = false; // one pass at a time: a pass waits on relays and can outlast the interval
+const pass = () => { if (running) return; running = true; once().catch((e) => log('error:', e.message)).finally(() => { running = false; }); };
+pass(); setInterval(pass, LOOP * 1000);
