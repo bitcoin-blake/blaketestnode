@@ -98,7 +98,7 @@ export function createTabNode({ base, snapshotUrl, blocksUrl, torrent = false, s
     else if (m.type === 'mempool') { node.mempool = m; }
     else if (m.type === 'error') { const lookup = node.synced && /Block not found|sync first|not in the set|not in mempool/.test(m.text); if (!lookup) { node.error = m.text; sync('Error: ' + m.text.slice(0, 140), null); } log((lookup ? '' : 'node error: ') + m.text.replace(/ @ .*$/, '') + (lookup ? ' (code -5)' : ''), 'err'); }
     else if (m.type === 'log') { log(m.text); }
-    emit(m.type, m); emit('message', m); }
+    if (m.type !== 'log') emit(m.type, m); emit('message', m); } // 'log' is the loader's own event above, so a worker log line is not delivered twice
 
   async function start() { const src = await (await fetch(`${base}/browser/worker.js`)).text(); const w = src.replace(/from '\.\.\/lib\//g, `from '${base}/lib/`).replace(/from '\.\/blocks\.js'/g, `from '${base}/browser/blocks.js'`);
     worker = new Worker(URL.createObjectURL(new Blob([w], { type: 'text/javascript' })), { type: 'module' }); worker.onmessage = onMessage; worker.onerror = (e) => { node.error = e.message || 'worker failed'; sync('Error: ' + node.error, null); log('worker error: ' + node.error, 'err'); };
