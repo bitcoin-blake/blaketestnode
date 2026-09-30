@@ -127,7 +127,7 @@ async function verify() {
 async function wipe() { const d = await dir(); for (const n of [SNAPSHOT.file, `${SNAPSHOT.file}.idx`, `${SNAPSHOT.file}.sha256`, `${SNAPSHOT.file}.ranges`]) { try { await d.removeEntry(n); } catch {} } }
 
 // ---- the chain: blocks from the served file, tip from the relays, validation against the set ----
-const chain = { node: null, utxo: null, source: null, bytes: null, nostr: null, deltas: [], syncing: false, timer: null, blocksUrl: null, mempool: null, mempoolSub: null, miner: null, job: null, jobKey: 0 };
+const chain = { node: null, utxo: null, source: null, bytes: null, nostr: null, deltas: [], syncing: false, timer: null, blocksUrl: null, mempool: null, mempoolSub: null, miner: null, solo: false, job: null, jobKey: 0 };
 // ---- mining what this tab built (datstr SPEC 6.3): the node is a gateway of one ----
 async function minerDeps() { const { k, hash } = await loadEngine(); const [pow, { blake2b }, secp, { makeSigner }] = await Promise.all([import(`${CDN}/codec/pow/knots-header-v2.js`), import(`${CDN}/codec/pow/blake2b.js`), import(`${CDN}/codec/secp256k1.js`), import(`${SIDESTR}/schnorr.mjs`)]); return { k, hash, pow, blake2b, signer: makeSigner({ hash, secp }) }; }
 async function startMining({ url, key, pay }) {
@@ -141,8 +141,22 @@ function newWork(why) {
   try { const job = wm.build(); chain.job = job; chain.jobKey++; post({ type: 'work', jobKey: chain.jobKey, height: job.height, work: Array.from(job.work), target: Array.from(job.shareTarget ?? job.netTarget), splitId: job.splitId, txs: job.txids.length, value: job.value, why }); }
   catch (e) { post({ type: 'log', text: 'work: ' + e.message }); }
 }
+// solo (datstr SPEC 6.3 without a pool): the block is this node's own, from its own tip and mempool, paying the tab's script;
+// the page hashes the work and hands a found block back; the page publishes it (kind 23405) for a node to submit
+async function startSolo({ key, pay }) {
+  if (!chain.node) throw new Error('sync first'); if (chain.miner) chain.miner.close();
+  const deps = await minerDeps(); const wm = makeWebMiner({ ...deps, node: chain.node, mempool: chain.mempool, key, payScript: pay, chain: CHAIN.network, url: null, log });
+  chain.miner = wm; chain.solo = true; post({ type: 'mining', pub: wm.pub, url: null, solo: true }); soloWork('start');
+}
+function soloWork(why) {
+  const wm = chain.miner; if (!wm || !chain.solo) return;
+  try { const job = wm.build(); chain.job = job; chain.jobKey++; const prev = chain.node.headers[job.height - 1];
+    post({ type: 'work', solo: true, jobKey: chain.jobKey, height: job.height, work: Array.from(job.work), target: Array.from(job.netTarget), txs: job.txids.length, value: job.value, fees: job.fees, time: job.time, bits: job.bits.toString(16), prevHash: job.prevHash, prevTime: prev ? (prev.timeOnWire ?? prev.time) : null, why }); }
+  catch (e) { post({ type: 'log', text: 'work: ' + e.message }); }
+}
 function foundNonce({ jobKey, nonce, nonce2 = 0 }) {
   const wm = chain.miner, job = chain.job; if (!wm || !job || jobKey !== chain.jobKey) return;
+  if (chain.solo) { const sh = wm.share(job, nonce, nonce2); if (!sh.ok || !sh.isBlock) return post({ type: 'log', text: `nonce ${nonce}: not a block (${sh.reason ?? 'above the target'})` }); post({ type: 'block-found', height: job.height, hash: sh.hash, hex: sh.blockHex, txs: job.txids.length, value: job.value }); post({ type: 'log', text: `BLOCK ${sh.hash} at ${job.height}, built and hashed in this tab` }); return; }
   const sh = wm.share(job, nonce, nonce2); if (!sh.ok) return post({ type: 'log', text: `share not sent: ${sh.reason}` });
   const sent = wm.send(sh.event, { isBlock: sh.isBlock }); post({ type: 'share', hash: sh.hash, height: job.height, isBlock: sh.isBlock, sent, sentTotal: wm.state.sent, dropped: wm.state.dropped });
   if (sh.isBlock) post({ type: 'log', text: `BLOCK ${sh.hash} at ${job.height}: in the share; a verifier with a node submits it` });
@@ -212,7 +226,7 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     }
     if (applied) await writeSmall('deltas.json', JSON.stringify(chain.deltas));
     if (applied) chain.mempool?.afterBlock();
-    if (applied && chain.miner) newWork(`tip ${chain.node.height}`);
+    if (applied && chain.miner) { if (chain.solo) soloWork(`tip ${chain.node.height}`); else newWork(`tip ${chain.node.height}`); }
     post({ type: 'synced', height: chain.node.height, hash: chain.node.tipHash(), time: chain.node.headers[chain.node.height]?.time ?? null, coins: utxo.size, applied, txs, ms: performance.now() - t0, stats: chain.node.stats, scripts: !noScripts, quiet: applied === 0 && !!chain.timer });
     if (!chain.timer) {
       chain.timer = setInterval(() => enqueue(() => withSnapshot(() => sync(chain.blocksUrl, { noScripts }))), 30_000);
@@ -273,7 +287,9 @@ async function handle(m) {
     else if (m.type === 'mempool-list') postMempool(true);
     else if (m.type === 'mine') await withSnapshot(() => startMining(m));
     else if (m.type === 'found') await withSnapshot(async () => foundNonce(m));
-    else if (m.type === 'stop-mining') { chain.miner?.close(); chain.miner = null; chain.job = null; post({ type: 'mining', pub: null }); }
+    else if (m.type === 'mine-solo') await withSnapshot(() => startSolo(m));
+    else if (m.type === 'solo-work') await withSnapshot(async () => soloWork(m.why ?? 'asked'));
+    else if (m.type === 'stop-mining') { chain.miner?.close(); chain.miner = null; chain.solo = false; chain.job = null; post({ type: 'mining', pub: null }); }
     else if (m.type === 'template') await withSnapshot(async () => { // the block this tab builds for itself
       const { k, hash } = await loadEngine(); if (!chain.node) throw new Error('sync first');
       const b = buildTemplate({ k, hash, node: chain.node, mempool: chain.mempool, payScripts: [m.pay], worker: m.worker }); const c = checkTemplate({ k, node: chain.node, block: b.block, height: b.height });

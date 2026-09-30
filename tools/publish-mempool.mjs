@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Publishes the local node's mempool as kind 23404 events (datstr SPEC 6.3: one transaction each,
+// Publishes the local node's mempool as kind 23404 events, and hands blocks found by web nodes (kind 23405, the block hex) to the local node with submitblock; (datstr SPEC 6.3: one transaction each,
 // tagged with the chain), so a web node can validate them itself and keep its own mempool; and
 // writes <alias>-mempool.json beside the block file so a web node can fill its mempool on start.
 //   node tools/publish-mempool.mjs --key-file ~/.datstr/mempool-txbt4.key --relays wss://a,wss://b [--loop 3] [--dir ~/knots-testnet4/snapshots] [--rsync user@host:path/]
@@ -21,7 +21,7 @@ const LOOP = Number(opt('--loop', 3)); const DIR = H(opt('--dir', '~/knots-testn
 const LIB = H(process.env.SIDESTR_LIB ?? ''); if (!LIB) { console.error('SIDESTR_LIB (path to sidestr siding/lib) is required'); process.exit(2); }
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 
-const [{ makeSigner }, { makeEvents, publish }, hash, secp] = await Promise.all([import(`${LIB}/schnorr.mjs`), import(`${LIB}/relay.mjs`), import(`${SCHEMA}/codec/hash.js`), import(`${SCHEMA}/codec/secp256k1.js`)]);
+const [{ makeSigner }, { makeEvents, publish, subscribe }, hash, secp, { verifyNostrEvent }] = await Promise.all([import(`${LIB}/schnorr.mjs`), import(`${LIB}/relay.mjs`), import(`${SCHEMA}/codec/hash.js`), import(`${SCHEMA}/codec/secp256k1.js`), import(`${SCHEMA}/codec/nostr.js`)]);
 const signer = makeSigner({ hash, secp }); const events = makeEvents({ signer, hash });
 const key = (await readFile(H(KEY_FILE), 'utf8')).trim(); if (!/^[0-9a-f]{64}$/.test(key)) { console.error('the key file must hold 32 bytes as hex'); process.exit(2); }
 log(`publishing ${CHAIN.network} mempool as kind ${MEMPOOL_KIND} from ${signer.pubkeyOf(key).slice(0, 12)}… to ${RELAYS.length} relays`);
@@ -48,6 +48,13 @@ async function once() {
   const json = JSON.stringify({ network: CHAIN.network, height, time: Math.floor(Date.now() / 1000), txs: now.map((txid) => ({ txid, ...published.get(txid) })) });
   if (json !== lastJson) { lastJson = json; await writeFile(file, json); if (RSYNC) await new Promise((resolve) => execFile('rsync', ['-a', file, RSYNC], (e) => { if (e) log(`rsync: ${e.message}`); resolve(); })); }
 }
+// blocks from web nodes: kind 23405, content the block hex, tagged with the chain; the node judges it, nothing else does
+const BLOCK_KIND = 23405; const seenBlocks = new Set();
+subscribe({ relays: RELAYS, chainId: CHAIN.network, kind: BLOCK_KIND, verify: verifyNostrEvent, since: 600, log, onEvent: async (ev) => {
+  if (seenBlocks.has(ev.id)) return; seenBlocks.add(ev.id); if (seenBlocks.size > 5000) seenBlocks.delete(seenBlocks.values().next().value);
+  const hex = String(ev.content).trim().toLowerCase(); const h = ev.tags.find((t) => t[0] === 'h')?.[1] ?? '?'; if (!/^[0-9a-f]+$/.test(hex) || hex.length > 8_000_000) return log(`block event ${ev.id.slice(0, 8)}… ignored: not block hex`);
+  try { const r = await rpc('submitblock', hex); log(`block from ${ev.pubkey.slice(0, 12)}… for height ${h} (${hex.length / 2} bytes): ${r === null ? 'ACCEPTED by the node' : 'refused: ' + r}`); }
+  catch (e) { log(`block from ${ev.pubkey.slice(0, 12)}… for height ${h}: submitblock failed: ${e.message}`); } } });
 let running = false; // one pass at a time: a pass waits on relays and can outlast the interval
 const pass = () => { if (running) return; running = true; once().catch((e) => log('error:', e.message)).finally(() => { running = false; }); };
 pass(); setInterval(pass, LOOP * 1000);
