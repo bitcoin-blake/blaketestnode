@@ -145,8 +145,8 @@ function newWork(why) {
 // the page hashes the work and hands a found block back; the page publishes it (kind 23405) for a node to submit
 async function startSolo({ key, pay }) {
   if (!chain.node) throw new Error('sync first'); if (chain.miner) chain.miner.close();
-  const deps = await minerDeps(); const wm = makeWebMiner({ ...deps, node: chain.node, mempool: chain.mempool, key, payScript: pay, chain: CHAIN.network, url: null, log });
-  chain.miner = wm; chain.solo = true; post({ type: 'mining', pub: wm.pub, url: null, solo: true }); soloWork('start');
+  const deps = await minerDeps(); const wm = makeWebMiner({ ...deps, node: chain.node, mempool: chain.mempool, key, payScript: pay, chain: CHAIN.network, url: null, log, now: () => Math.max(Math.floor(Date.now() / 1000), chain.soloAt ?? 0) });
+  chain.miner = wm; chain.solo = true; chain.soloAt = null; post({ type: 'mining', pub: wm.pub, url: null, solo: true }); soloWork('start');
 }
 function soloWork(why) {
   const wm = chain.miner; if (!wm || !chain.solo) return;
@@ -288,7 +288,7 @@ async function handle(m) {
     else if (m.type === 'mine') await withSnapshot(() => startMining(m));
     else if (m.type === 'found') await withSnapshot(async () => foundNonce(m));
     else if (m.type === 'mine-solo') await withSnapshot(() => startSolo(m));
-    else if (m.type === 'solo-work') await withSnapshot(async () => soloWork(m.why ?? 'asked'));
+    else if (m.type === 'solo-work') await withSnapshot(async () => { chain.soloAt = m.at ? Number(m.at) : null; soloWork(m.why ?? 'asked'); }); // at: date the block to this time (the window's boundary) when it is later than the clock
     else if (m.type === 'stop-mining') { chain.miner?.close(); chain.miner = null; chain.solo = false; chain.job = null; post({ type: 'mining', pub: null }); }
     else if (m.type === 'template') await withSnapshot(async () => { // the block this tab builds for itself
       const { k, hash } = await loadEngine(); if (!chain.node) throw new Error('sync first');
