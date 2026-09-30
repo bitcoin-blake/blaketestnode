@@ -276,6 +276,14 @@ async function handle(m) {
         const tx = blocks.get(c.height).find((t) => k.codec.txid(t) === txid); if (tx) c.inputs = tx.inputs.map((i) => `${i.prevout.txid}:${i.prevout.vout}`); }
       post({ type: 'coins', script: want, height: chain.node?.height ?? null, coins: out, note: 'coins from before the snapshot are not scanned (the index is by txid)' }); });
     else if (m.type === 'coin') await withSnapshot(() => coin(m.key));
+    else if (m.type === 'spend') await withSnapshot(async () => { // the transaction that spent an outpoint, looked for in the blocks from `from` to the tip (a channel watching its funding output)
+      const { k } = await loadEngine(); if (!chain.source?.byHeight || !chain.node) throw new Error('sync first'); const want = String(m.key).toLowerCase(); const [txid, vout] = [want.slice(0, 64), Number(want.slice(65))];
+      for (let h = Math.max(Number(m.from) || (chain.node.height - 50), SNAPSHOT.baseHeight + 1); h <= chain.node.height; h++) { const e = chain.source.byHeight.get(h); if (!e) continue; const block = k.codec.decode('Block', await chain.source.blockHex(h));
+        for (const tx of block.transactions) if (tx.inputs.some((i) => i.prevout.txid === txid && i.prevout.vout === vout)) return post({ type: 'spend', key: want, found: true, height: h, blockHash: e.hash, txid: k.codec.txid(tx), hex: k.codec.encodeHex('Transaction', tx), req: m.req ?? null }); }
+      post({ type: 'spend', key: want, found: false, to: chain.node.height, req: m.req ?? null }); });
+    else if (m.type === 'tx') await withSnapshot(async () => { // a transaction by txid in a given block
+      const { k } = await loadEngine(); const e = chain.source?.byHeight?.get(Number(m.height)); if (!e) throw new Error('Block not found'); const block = k.codec.decode('Block', await chain.source.blockHex(Number(m.height))); const tx = block.transactions.find((t) => k.codec.txid(t) === String(m.txid).toLowerCase());
+      post({ type: 'tx', txid: m.txid, height: Number(m.height), found: !!tx, hex: tx ? k.codec.encodeHex('Transaction', tx) : null, req: m.req ?? null }); });
     else if (m.type === 'mempool') { // datstr SPEC 6.3: transactions from relays, validated here; a seed file from the mirror fills it on start
       const { k, nostr } = await loadEngine(); if (!chain.node) throw new Error('sync first'); if (chain.mempoolSub) chain.mempoolSub.close();
       const mp = new Mempool({ k, node: chain.node, network: CHAIN.network, log, onChange: () => postMempool() }); chain.mempool = mp;
