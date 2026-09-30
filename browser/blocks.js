@@ -9,7 +9,7 @@ export class OpfsBlockSource {
     return JSON.parse(t);
   }
   async update() {
-    const r = await fetch(`${this.base}.json`, { cache: 'no-store' });
+    const r = await fetch(`${this.base}.json`, { cache: 'no-cache' }); // revalidated with the ETag: an unchanged index costs a 304, not the whole file
     if (!r.ok) throw new Error(`block index ${r.status} (needs Range and CORS)`);
     const index = await r.json();
     const local = JSON.parse((await this.files.readText('blocks.json')) ?? '{"blocks":[]}');

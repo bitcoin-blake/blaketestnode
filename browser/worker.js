@@ -230,15 +230,15 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     post({ type: 'synced', height: chain.node.height, hash: chain.node.tipHash(), time: chain.node.headers[chain.node.height]?.time ?? null, coins: utxo.size, applied, txs, ms: performance.now() - t0, stats: chain.node.stats, scripts: !noScripts, quiet: applied === 0 && !!chain.timer });
     if (!chain.timer) {
       chain.timer = setInterval(() => enqueue(() => withSnapshot(() => sync(chain.blocksUrl, { noScripts }))), 30_000);
-      subscribeTip(k, CHAIN.nip333, (t) => { chain.nostr = { ...t, agree: chain.node.chain[t.height] ? 1 : 0 }; post({ type: 'nostr', ...chain.nostr, live: true }); if (t.height > chain.node.height) setTimeout(() => enqueue(() => withSnapshot(() => sync(chain.blocksUrl, { noScripts }))), 3000); }, { nostr, log });
+      subscribeTip(k, CHAIN.nip333, (t) => { chain.nostr = { ...t, agree: chain.node.chain[t.height] === t.hash ? 1 : 0, diverged: !!chain.node.chain[t.height] && chain.node.chain[t.height] !== t.hash }; post({ type: 'nostr', ...chain.nostr, live: true }); if (t.height > chain.node.height) setTimeout(() => enqueue(() => withSnapshot(() => sync(chain.blocksUrl, { noScripts }))), 3000); }, { nostr, log });
     }
   } finally { chain.syncing = false; }
 }
 // the page's view of the mempool: every transaction with what a wallet needs (inputs, outputs, fee); posted on change, at most every 200 ms
-let mpTimer = null;
+let mpTimer = null; const watch = { scripts: new Set(), outpoints: new Set() }; // a wallet's scripts and coins: their transactions are always sent, past the first 1,000
 function postMempool(now = false) { if (!chain.mempool) return; if (mpTimer && !now) return; if (mpTimer) clearTimeout(mpTimer);
   mpTimer = setTimeout(() => { mpTimer = null; const mp = chain.mempool; const list = mp.list(); const keyOf = (p) => `${p.txid}:${p.vout}`;
-    post({ type: 'mempool', height: chain.node?.height ?? null, count: list.length, bytes: list.reduce((a, e) => a + e.vsize, 0), fees: list.reduce((a, e) => a + e.fee, 0), stats: mp.stats, txs: list.slice(0, 1000).map((e) => ({ txid: e.txid, fee: e.fee, vsize: e.vsize, feeRate: e.feeRate, at: e.at, inputs: e.tx.inputs.map((i) => keyOf(i.prevout)), outputs: e.tx.outputs.map((o) => ({ value: o.value, scriptPubKey: o.scriptPubKey })) })) }); }, now ? 0 : 200); }
+    post({ type: 'mempool', height: chain.node?.height ?? null, count: list.length, bytes: list.reduce((a, e) => a + e.vsize, 0), fees: list.reduce((a, e) => a + e.fee, 0), stats: mp.stats, txs: list.filter((e, i) => i < 1000 || e.tx.outputs.some((o) => watch.scripts.has(o.scriptPubKey)) || e.tx.inputs.some((x) => watch.outpoints.has(keyOf(x.prevout)))).map((e) => ({ txid: e.txid, fee: e.fee, vsize: e.vsize, feeRate: e.feeRate, at: e.at, inputs: e.tx.inputs.map((i) => keyOf(i.prevout)), outputs: e.tx.outputs.map((o) => ({ value: o.value, scriptPubKey: o.scriptPubKey })) })) }); }, now ? 0 : 200); }
 async function coin(key) {
   const { k } = await loadEngine(); const utxo = await loadSet();
   const c = utxo.get(key);
@@ -266,6 +266,7 @@ async function handle(m) {
       const height = m.hash ? [...chain.source.byHeight.values()].find((e) => e.hash === String(m.hash).toLowerCase())?.height : Number(m.height); const e = height != null && !Number.isNaN(height) ? chain.source.byHeight.get(height) : null; if (!e) throw new Error('Block not found');
       const block = k.codec.decode('Block', await chain.source.blockHex(height)); const txids = block.transactions.map((tx) => k.codec.txid(tx));
       post({ type: 'block', height, hash: e.hash, size: e.size, header: block.header, nTx: txids.length, txids, previousblockhash: block.header.prevBlockHash, nextblockhash: chain.source.byHeight.get(height + 1)?.hash ?? null, confirmations: chain.node ? chain.node.height - height + 1 : null, req: m.req ?? null }); });
+    else if (m.type === 'watch') { watch.scripts = new Set(m.scripts ?? []); watch.outpoints = new Set(m.outpoints ?? []); postMempool(true); }
     else if (m.type === 'coins') await withSnapshot(async () => { // the unspent coins paying a script, among those created since the snapshot (a page wallet's balance)
       if (!chain.utxo) throw new Error('sync first'); const want = String(m.script).toLowerCase(); const out = [];
       for (const [key, c] of chain.utxo.fresh) if (c?.output?.scriptPubKey === want) out.push({ key, value: c.output.value, height: c.height, coinbase: !!c.coinbase, inputs: [] });
