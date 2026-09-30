@@ -220,6 +220,11 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     }
   } finally { chain.syncing = false; }
 }
+// the page's view of the mempool: every transaction with what a wallet needs (inputs, outputs, fee); posted on change, at most every 200 ms
+let mpTimer = null;
+function postMempool(now = false) { if (!chain.mempool) return; if (mpTimer && !now) return; if (mpTimer) clearTimeout(mpTimer);
+  mpTimer = setTimeout(() => { mpTimer = null; const mp = chain.mempool; const list = mp.list(); const keyOf = (p) => `${p.txid}:${p.vout}`;
+    post({ type: 'mempool', height: chain.node?.height ?? null, count: list.length, bytes: list.reduce((a, e) => a + e.vsize, 0), fees: list.reduce((a, e) => a + e.fee, 0), stats: mp.stats, txs: list.slice(0, 1000).map((e) => ({ txid: e.txid, fee: e.fee, vsize: e.vsize, feeRate: e.feeRate, at: e.at, inputs: e.tx.inputs.map((i) => keyOf(i.prevout)), outputs: e.tx.outputs.map((o) => ({ value: o.value, scriptPubKey: o.scriptPubKey })) })) }); }, now ? 0 : 200); }
 async function coin(key) {
   const { k } = await loadEngine(); const utxo = await loadSet();
   const c = utxo.get(key);
@@ -257,9 +262,12 @@ async function handle(m) {
         const tx = blocks.get(c.height).find((t) => k.codec.txid(t) === txid); if (tx) c.inputs = tx.inputs.map((i) => `${i.prevout.txid}:${i.prevout.vout}`); }
       post({ type: 'coins', script: want, height: chain.node?.height ?? null, coins: out, note: 'coins from before the snapshot are not scanned (the index is by txid)' }); });
     else if (m.type === 'coin') await withSnapshot(() => coin(m.key));
-    else if (m.type === 'mempool') { // datstr SPEC 6.3: transactions from relays, validated here
+    else if (m.type === 'mempool') { // datstr SPEC 6.3: transactions from relays, validated here; a seed file from the mirror fills it on start
       const { k, nostr } = await loadEngine(); if (!chain.node) throw new Error('sync first'); if (chain.mempoolSub) chain.mempoolSub.close();
-      chain.mempool = new Mempool({ k, node: chain.node, network: CHAIN.network, log }); chain.mempoolSub = await subscribeMempool(chain.mempool, { relays: m.relays, network: CHAIN.network, nostr, log }); post({ type: 'mempool', count: 0, relays: m.relays }); }
+      chain.mempool = new Mempool({ k, node: chain.node, network: CHAIN.network, log, onChange: () => postMempool() }); chain.mempoolSub = await subscribeMempool(chain.mempool, { relays: m.relays, network: CHAIN.network, nostr, also: m.also ?? [], log });
+      if (m.seedUrl) { try { const r = await fetch(m.seedUrl, { cache: 'no-store' }); if (r.ok) { const j = await r.json(); let n = 0; for (const t of j.txs ?? []) { if (chain.mempool.add(t.hex, 'the mirror').ok) n++; } log(`mempool: ${n} of ${(j.txs ?? []).length} from the mirror's file at height ${j.height}`); } } catch (e) { log(`mempool: seed file: ${e.message}`); } }
+      postMempool(true); }
+    else if (m.type === 'mempool-list') postMempool(true);
     else if (m.type === 'mine') await withSnapshot(() => startMining(m));
     else if (m.type === 'found') await withSnapshot(async () => foundNonce(m));
     else if (m.type === 'stop-mining') { chain.miner?.close(); chain.miner = null; chain.job = null; post({ type: 'mining', pub: null }); }
