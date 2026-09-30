@@ -151,7 +151,7 @@ async function startSolo({ key, pay, tag = null }) {
 function soloWork(why) {
   const wm = chain.miner; if (!wm || !chain.solo) return;
   try { const job = wm.build(); chain.job = job; chain.jobKey++; const prev = chain.node.headers[job.height - 1];
-    post({ type: 'work', solo: true, jobKey: chain.jobKey, height: job.height, work: Array.from(job.work), target: Array.from(job.netTarget), txs: job.txids.length, value: job.value, fees: job.fees, time: job.time, bits: job.bits.toString(16), prevHash: job.prevHash, prevTime: prev ? (prev.timeOnWire ?? prev.time) : null, why }); }
+    post({ type: 'work', solo: true, jobKey: chain.jobKey, height: job.height, work: Array.from(job.work), target: Array.from(job.netTarget), txs: job.txids.length, value: job.value, fees: job.fees, time: job.time, bits: job.bits.toString(16), prevHash: job.prevHash, coinbase: job.coinbaseHex, prevTime: prev ? (prev.timeOnWire ?? prev.time) : null, why }); }
   catch (e) { post({ type: 'log', text: 'work: ' + e.message }); }
 }
 function foundNonce({ jobKey, nonce, nonce2 = 0 }) {
