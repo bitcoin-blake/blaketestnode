@@ -264,8 +264,11 @@ async function handle(m) {
     else if (m.type === 'coin') await withSnapshot(() => coin(m.key));
     else if (m.type === 'mempool') { // datstr SPEC 6.3: transactions from relays, validated here; a seed file from the mirror fills it on start
       const { k, nostr } = await loadEngine(); if (!chain.node) throw new Error('sync first'); if (chain.mempoolSub) chain.mempoolSub.close();
-      chain.mempool = new Mempool({ k, node: chain.node, network: CHAIN.network, log, onChange: () => postMempool() }); chain.mempoolSub = await subscribeMempool(chain.mempool, { relays: m.relays, network: CHAIN.network, nostr, also: m.also ?? [], log });
-      if (m.seedUrl) { try { const r = await fetch(m.seedUrl, { cache: 'no-store' }); if (r.ok) { const j = await r.json(); let n = 0; for (const t of j.txs ?? []) { if (chain.mempool.add(t.hex, 'the mirror').ok) n++; } log(`mempool: ${n} of ${(j.txs ?? []).length} from the mirror's file at height ${j.height}`); } } catch (e) { log(`mempool: seed file: ${e.message}`); } }
+      const mp = new Mempool({ k, node: chain.node, network: CHAIN.network, log, onChange: () => postMempool() }); chain.mempool = mp;
+      // a check reads the UTXO set, which needs the snapshot attached: adds from the relays are queued as jobs like everything else
+      const rawAdd = mp.add.bind(mp); mp.add = (hex, from) => { enqueue(() => withSnapshot(() => { rawAdd(hex, from); })); return { ok: true, queued: true }; };
+      chain.mempoolSub = await subscribeMempool(mp, { relays: m.relays, network: CHAIN.network, nostr, also: m.also ?? [], log });
+      if (m.seedUrl) { try { const r = await fetch(m.seedUrl, { cache: 'no-store' }); if (r.ok) { const j = await r.json(); let n = 0; await withSnapshot(() => { for (const t of j.txs ?? []) { if (rawAdd(t.hex, 'the mirror').ok) n++; } }); log(`mempool: ${n} of ${(j.txs ?? []).length} from the mirror's file at height ${j.height}`); } } catch (e) { log(`mempool: seed file: ${e.message}`); } }
       postMempool(true); }
     else if (m.type === 'mempool-list') postMempool(true);
     else if (m.type === 'mine') await withSnapshot(() => startMining(m));
