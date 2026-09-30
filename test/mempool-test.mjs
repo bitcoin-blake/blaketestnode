@@ -40,7 +40,7 @@ const good = spend(coinA, 100000, other, 300); pool[good.txid] = good.hex; await
 t('a valid spend published by the gateway is accepted by the web node after its own validation', mp.txs.has(good.txid) && mp.stats.accepted === 1);
 t('the accepted transaction is served with its fee and size', (() => { const e = mp.txs.get(good.txid); return e && e.fee === 300 && e.vsize > 100 && mp.list()[0].txid === good.txid; })());
 const double = spend(coinA, 100000, mine, 400); pool[double.txid] = double.hex; await pubr.tick(); await wait();
-t('a second spend of the same coin is refused: input spent by a mempool transaction', !mp.txs.has(double.txid) && refusals.some((m) => /spent by a mempool/.test(m)));
+t('a second spend of the same coin that pays too little more is refused as a replacement', !mp.txs.has(double.txid) && mp.txs.has(good.txid) && refusals.some((m) => /a replacement must pay/.test(m)));
 const missing = spend({ txid: 'dd'.repeat(32), vout: 0 }, 1000, other, 200); pool[missing.txid] = missing.hex; await pubr.tick(); await wait();
 t('a spend of a coin the node does not have is refused', !mp.txs.has(missing.txid) && refusals.some((m) => /not an unspent coin/.test(m)));
 const cheap = spend(coinB, 50000, other, 5); pool[cheap.txid] = cheap.hex; await pubr.tick(); await wait();
@@ -49,8 +49,10 @@ const forged = spend(coinB, 50000, other, 300, { badSig: true }); pool[forged.tx
 t('a bad signature is refused by the interpreter', !mp.txs.has(forged.txid) && refusals.some((m) => /input 0/.test(m)));
 const young = spend({ txid: 'cc'.repeat(32), vout: 0 }, 70000, other, 300); pool[young.txid] = young.hex; await pubr.tick(); await wait();
 t('an immature coinbase is refused', !mp.txs.has(young.txid) && refusals.some((m) => /immature/.test(m)));
-// a block confirms the good spend: the node's set moves and the mempool drops it
+const better = spend(coinA, 100000, other, 700); pool[better.txid] = better.hex; await pubr.tick(); await wait();
+t('a replacement paying more in total and per vB (BIP 125) takes the original\'s place', mp.txs.has(better.txid) && !mp.txs.has(good.txid) && mp.spent.size === 1);
+// a block confirms the good spend after all (it won the race): the node's set moves and the mempool drops the replacement
 utxo.delete(`${coinA.txid}:0`); utxo.set(`${good.txid}:0`, { output: good.tx.outputs[0], height: 501, coinbase: false }); node.height = 501; mp.afterBlock();
-t('after the block that confirms it, the transaction leaves the mempool and its inputs are released', !mp.txs.has(good.txid) && mp.spent.size === 0 && mp.stats.dropped === 1);
+t('after the block that confirms the original, the replacement leaves the mempool and its inputs are released', !mp.txs.has(good.txid) && !mp.txs.has(better.txid) && mp.spent.size === 0 && mp.stats.dropped === 2);
 t('the wrong chain tag is ignored: an event for another chain never reaches validation', (() => { const before = mp.stats.seen; const ev = { kind: MEMPOOL_KIND, tags: [['chain', 'btc:mainnet']] }; return before === mp.stats.seen; })());
 pubr.close(); sub.close(); server.close(); console.log(`\n${ok} passed, ${bad} failed`); process.exit(bad ? 1 : 0);
