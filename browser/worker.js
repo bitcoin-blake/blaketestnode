@@ -143,9 +143,9 @@ function newWork(why) {
 }
 // solo (datstr SPEC 6.3 without a pool): the block is this node's own, from its own tip and mempool, paying the tab's script;
 // the page hashes the work and hands a found block back; the page publishes it (kind 23405) for a node to submit
-async function startSolo({ key, pay }) {
+async function startSolo({ key, pay, tag = null }) {
   if (!chain.node) throw new Error('sync first'); if (chain.miner) chain.miner.close();
-  const deps = await minerDeps(); const wm = makeWebMiner({ ...deps, node: chain.node, mempool: chain.mempool, key, payScript: pay, chain: CHAIN.network, url: null, log, now: () => Math.max(Math.floor(Date.now() / 1000), chain.soloAt ?? 0) });
+  const deps = await minerDeps(); const wm = makeWebMiner({ ...deps, node: chain.node, mempool: chain.mempool, key, payScript: pay, chain: CHAIN.network, url: null, tag, log, now: () => Math.max(Math.floor(Date.now() / 1000), chain.soloAt ?? 0) });
   chain.miner = wm; chain.solo = true; chain.soloAt = null; post({ type: 'mining', pub: wm.pub, url: null, solo: true }); soloWork('start');
 }
 function soloWork(why) {
