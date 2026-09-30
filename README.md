@@ -59,7 +59,7 @@ node tools/export-blocks.mjs --loop 20                                 # keep th
 
 Options: `--data <dir>` (default `~/.blaketestnode/txbt4`), `--source http|rpc`, `--blocks-url <url>`,
 `--webseed <url>`, `--conf <bitcoin.conf>`, `--to <height>`, `--no-scripts`; for `run` also `--api <port>`,
-`--poll <seconds>`, `--checkpoint-every <blocks>` (2016). A restart with the index on disk
+`--poll <seconds>`, `--checkpoint-every <blocks>` (2016), `--address-index`, `--pair-api <url>`. A restart with the index on disk
 takes seconds; building the index for a new snapshot takes about 20 s. The engine is loaded from `$SCHEMA` or
 `~/bitcoin-desktop/schema`; it needs bitcoin-desktop/schema v0.0.27 or later (unified sighash, pay-to-anchor).
 
@@ -91,6 +91,33 @@ mature, value, scripts with the chain's sighash, a fee floor. What passes is ser
 `/mempool` and `/mempool/<txid>` and dropped when a block confirms or conflicts with it.
 `--mempool-publishers pk,pk` limits the publishers. `node test/mempool-test.mjs` runs both ends
 through a local relay (it imports the gateway's publisher from `$DATSTR_GATEWAY`).
+
+## Addresses, on both branches of the fork
+
+With `--address-index` the daemon also answers by address, in Esplora's shape, from its own
+validated UTXO set: `/address/<addr>/utxo` lists the unspent coins (mempool outputs to the address
+unconfirmed, coins a mempool transaction spends left out), and `/address/<addr>` gives
+`chain_stats` and `mempool_stats` whose `funded_txo_sum - spent_txo_sum` is the balance, as
+[blaketest](https://github.com/bitcoin-blake/blaketest) reads it. A UTXO node keeps no history, so the
+stats count what is unspent now and `tx_count` is `null`. The index is one sorted `u64` per coin
+(FNV-1a of the script, entry number), built once beside the snapshot or checkpoint as `<file>.sidx`
+and bound to its sha256: about 8 s and 108 MiB for the 14.2M-coin fork snapshot (measured at 2M
+coins: 1.2 s, 0.02 ms a lookup). A hash match is only a candidate; every hit is read back from the
+set and its script compared, and spent coins drop out through the set's own bitmap, so blocks and
+rollbacks need no rebuild. Coins made after the snapshot are followed in a side map.
+
+The BLAKE2b chain and stock testnet4 share every block up to the snapshot base (150,307), and an
+address is the same string on both, so a key made before the fork owns the same coins on both
+chains until each is spent. With `--pair-api <url>` (an Esplora API on the other branch, e.g.
+`https://mempool.space/testnet4/api`; env `BLAKETESTNODE_PAIR_API`), `/address/<addr>/pair` shows
+one address from both sides: what is only on this branch, only on the other, and `both` (the coins
+unspent on each). The answer is the same whichever chain the holder started from: coins in `both`
+can be carried across in either direction, and a spend signed without `SIGHASH_UNIFIED` is valid on
+both branches (one signed with it only here). The pair's coins are the API's word, not validated
+here; the API is checked once to be on the other side of this fork (its block 150,307 is the
+snapshot base, its block 150,308 is not ours) and refused otherwise.
+`SCHEMA=<schema> node test/address-test.mjs` runs both on a small real snapshot file, with two
+scripts chosen to collide in the index hash, and a stand-in Esplora for the other branch.
 
 ## The block it builds (datstr SPEC 6.3)
 
@@ -180,6 +207,8 @@ validates with scripts on. Signature checks are about 48 of the 51 s, pure-JS se
 - `lib/node.mjs` the chain state machine: headers, applied hashes, undo records
 - `lib/state.mjs` checkpoints: the UTXO set written as a snapshot with a manifest
 - `lib/api.mjs`, `lib/status.html` the HTTP routes, tip stream and status page
+- `lib/scriptindex.mjs` the address index: sorted script hashes over the packed entries, a side map for new coins
+- `lib/pair.mjs` the other branch of the fork through an Esplora API, and one address compared across both
 - `ops/blaketestnode.config.example.cjs` pm2 example
 - `tools/export-blocks.mjs` keeps the served block file current from a node
 - `lib/engine.mjs`, `lib/rpc.mjs` engine and node RPC loaders

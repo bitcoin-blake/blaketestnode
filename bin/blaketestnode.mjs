@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// blaketestnode: fetch | verify | sync | bench | run   (--data <dir>, --source http|rpc, --blocks-url <url>, --webseed <url>, --conf <bitcoin.conf>, --no-scripts, --to <height>, --api <port>, --poll <s>, --checkpoint-every <n>)
+// blaketestnode: fetch | verify | sync | bench | run   (--data <dir>, --source http|rpc, --blocks-url <url>, --webseed <url>, --conf <bitcoin.conf>, --no-scripts, --to <height>, --api <port>, --poll <s>, --checkpoint-every <n>, --address-index, --pair-api <url>)
 import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { CHAIN, SNAPSHOT } from '../lib/params.mjs';
@@ -19,6 +19,8 @@ import { Mempool, subscribeMempool } from '../lib/mempool.mjs';
 import { buildTemplate, checkTemplate } from '../lib/template.mjs';
 import { SCHEMA } from '../lib/engine.mjs';
 import { DeltaLog, applyDelta } from '../lib/delta.mjs';
+import { ScriptIndex, buildScriptKeys, scriptIndexBytes, parseScriptIndexBytes, followSet } from '../lib/scriptindex.mjs';
+import { makePair } from '../lib/pair.mjs';
 
 const argv = process.argv.slice(2);
 const cmd = argv[0] ?? 'bench';
@@ -31,6 +33,7 @@ const SOURCE = opt('--source', 'http'); // http: a served block file + NIP-333 t
 if (opt('--blocks-url')) CHAIN.blocksUrl = opt('--blocks-url');
 if (opt('--webseed')) SNAPSHOT.webseed = opt('--webseed');
 const API = Number(opt('--api', 3337)); const POLL = Number(opt('--poll', 30)); const CKPT = Number(opt('--checkpoint-every', 2016));
+const ADDRESS_INDEX = argv.includes('--address-index'); const PAIR_API = opt('--pair-api') ?? process.env.BLAKETESTNODE_PAIR_API ?? null;
 const log = (...a) => console.error(new Date().toISOString().slice(11, 19), ...a);
 const bench = {};
 const newHasher = await hasherFactory();
@@ -73,6 +76,20 @@ function load({ path = snapPath, sha256 = SNAPSHOT.sha256, expect = SNAPSHOT } =
   const utxo = new PackedUtxo(source, index);
   log(`utxo set: ${utxo.size.toLocaleString()} coins, ${mb()}`);
   return utxo;
+}
+
+// The address index for a loaded snapshot or checkpoint: built once beside it (one more parse, no
+// hashing), read back on later starts, and bound to the file's sha256 like the packed index.
+function loadScripts(utxo, { path, sha256 }) {
+  const sidxPath = `${path}.sidx`; const t0 = performance.now();
+  let keys = null;
+  if (existsSync(sidxPath)) { try { keys = parseScriptIndexBytes(new Uint8Array(readFileSync(sidxPath)), sha256); } catch (e) { log(`address index unusable (${e.message}), rebuilding`); } }
+  if (keys && keys.length !== utxo.count) { log('address index does not match the packed index, rebuilding'); keys = null; }
+  const from = keys ? 'file' : 'built';
+  if (!keys) { keys = buildScriptKeys(utxo.file, utxo.count, { log }); writeFileSync(sidxPath, scriptIndexBytes(keys, sha256)); }
+  bench.addressIndex = { ms: +(performance.now() - t0).toFixed(0), coins: keys.length, from, bytes: keys.length * 8 };
+  log(`address index ${from === 'file' ? 'read' : 'built'}: ${keys.length.toLocaleString()} coins in ${bench.addressIndex.ms} ms, ${mb()}`);
+  return followSet(utxo, new ScriptIndex(utxo, keys));
 }
 
 async function sync(utxo) {
@@ -186,7 +203,7 @@ async function run() {
   const startedAt = Date.now();
   const st = { state: 'starting', nostr: null, file: null, checkpoint: null, saving: false, lastTickAt: null, rollbacks: 0, startedFrom: null, tipTime: null };
   let node = null, utxo = null, api = null;
-  const status = () => ({ network: CHAIN.network, alias: CHAIN.alias, height: node?.height ?? -1, mempool: mempool ? { count: mempool.size, ...mempool.stats } : null, hash: node?.tipHash() ?? null, tipTime: st.tipTime, coins: utxo?.size ?? 0, state: st.state, saving: st.saving,
+  const status = () => ({ network: CHAIN.network, alias: CHAIN.alias, height: node?.height ?? -1, mempool: mempool ? { count: mempool.size, ...mempool.stats } : null, addressIndex: api?.scripts ? { coins: api.scripts.size } : api?.scripts === null ? null : 'loading', pair: api?.pair ? { alias: api.pair.alias, api: api.pair.api } : null, hash: node?.tipHash() ?? null, tipTime: st.tipTime, coins: utxo?.size ?? 0, state: st.state, saving: st.saving,
     checkpoint: st.checkpoint, deltas: node ? deltas?.length ?? 0 : 0, nostr: st.nostr, file: st.file, lastTickAt: st.lastTickAt, uptimeS: Math.floor((Date.now() - startedAt) / 1000), rssMiB: Math.round(process.memoryUsage().rss / 1048576),
     run: node ? { blocks: node.stats.blocks, txs: node.stats.txs, validateMs: Math.round(node.stats.validateMs), failed: node.stats.failed, rollbacks: st.rollbacks, startedFrom: st.startedFrom, skipped: node.stats.skipped } : { blocks: 0, txs: 0, validateMs: 0, failed: 0, rollbacks: 0, startedFrom: st.startedFrom } });
   // datstr SPEC 6.3: --mempool-relays wss://a,wss://b follows kind 23404 events and validates each transaction here
@@ -194,20 +211,23 @@ async function run() {
   const PUBLISHERS = String(opt('--mempool-publishers') ?? '').split(',').map((x) => x.trim()).filter(Boolean);
   let mempool = null;
   api = await startApi({ port: API, status, node: () => node, source, k, mempool: null, log }); // before the long load, so a port clash fails fast
+  if (!ADDRESS_INDEX) api.scripts = null;
+  if (PAIR_API) api.pair = makePair({ api: PAIR_API, alias: CHAIN.pairAlias, forkHeight: CHAIN.forkHeight });
   let file = await source.update(); st.file = { ...file, blocks: source.index.blocks.length, at: Math.floor(Date.now() / 1000) };
   const ctx = await source.contextHeaders(CHAIN.blocksUrl.replace(/-blocks$/, '-context-headers.json'));
   const magic = CHAIN.networkMagic;
 
   // newest checkpoint still on the served chain, else the fork snapshot
-  let base;
+  let base, from = { path: snapPath, sha256: SNAPSHOT.sha256 };
   for (const m of listStates(DATA)) {
     if (m.base_height > source.index.to || (await source.hash(m.base_height)) !== m.base_hash) { log(`checkpoint ${m.base_height} is not on the served chain, skipping`); continue; }
     log(`loading checkpoint ${m.base_height} ${m.base_hash.slice(0, 16)}…`);
     try { utxo = load({ path: m.path, sha256: m.sha256, expect: m }); } catch (e) { log(`checkpoint unusable (${e.message}), skipping`); utxo = null; continue; }
-    base = { height: m.base_height, hash: m.base_hash }; st.checkpoint = { height: m.base_height, hash: m.base_hash, bytes: m.bytes }; break;
+    base = { height: m.base_height, hash: m.base_hash }; from = { path: m.path, sha256: m.sha256 }; st.checkpoint = { height: m.base_height, hash: m.base_hash, bytes: m.bytes }; break;
   }
   if (!utxo) { utxo = load(); base = { height: SNAPSHOT.baseHeight, hash: SNAPSHOT.baseHash }; }
   st.startedFrom = `${base.height}`;
+  if (ADDRESS_INDEX) api.scripts = loadScripts(utxo, from); // before the deltas, so the coins they add are followed
   // deltas since that base: our own record of every block applied, replayed in seconds
   const deltas = new DeltaLog(`${DATA}/deltas.jsonl`);
   let replayed = 0;
@@ -248,7 +268,7 @@ async function run() {
       if (common < node.height) {
         log(`reorg: served chain diverges above ${common}, rolling back ${node.height - common} block(s)`);
         try { const from = node.height; node.rollbackTo(common); deltas.truncate(common); st.rollbacks += from - common; }
-        catch (e) { log(`${e.message}; discarding checkpoints above ${common} and restarting`); for (const m of listStates(DATA)) if (m.base_height > common) { unlinkSync(m.path); unlinkSync(m.path.replace(/\.dat$/, '.json')); } process.exit(3); }
+        catch (e) { log(`${e.message}; discarding checkpoints above ${common} and restarting`); for (const m of listStates(DATA)) if (m.base_height > common) { unlinkSync(m.path); unlinkSync(m.path.replace(/\.dat$/, '.json')); if (existsSync(`${m.path}.sidx`)) unlinkSync(`${m.path}.sidx`); } process.exit(3); }
       }
       const to = source.index.to;
       if (to > node.height) st.state = 'syncing';
