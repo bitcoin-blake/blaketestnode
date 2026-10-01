@@ -47,10 +47,10 @@ const torrentFileUrl = (snapshotUrl) => snapshotUrl.replace(/\.dat$/, '') + '.to
 // INTEGRITY:BEGIN
 export const CODE_SHA256 = {
   'browser/blocks.js': 'd64c9d892a979502111c9ea1cf06ad7a588cd3b6e6d1e1dbb2d9f670de481573',
-  'browser/worker.js': '8ac59b8fc6f249122241a4efb5001d25fdf3281c38ae5a31960fba45450de1cf',
+  'browser/worker.js': 'b7baff4439e08412b585ad285280bd4679db5a87f33d11305f561004ef9236ec',
   'lib/bytes.mjs': 'c03070261249baaab1475caa4bf34f40c81556bc5fff97817c69951a356439d3',
   'lib/mempool.mjs': 'cd6fb29f9ad4c30e2430516a1cf2c2b43883a611e15bc6084df57068565bad23',
-  'lib/nip333.mjs': 'b37f010aa720237014d61633c4c26d0d6571fb38e27d6165a58d6c85df1b05a3',
+  'lib/nip333.mjs': 'cf70c52217c632dad25345e82718c05eeb072c4763c5e726c49690f5c015c2fd',
   'lib/node.mjs': '94713169c52c1443bc1def4cc0ede7647113b62da976bc8623b8018e5984e727',
   'lib/packed.mjs': 'bf79465a5bf4bfcbbec600d8f42b3ded81f1daf8a065ea95c4c08977460ceb3c',
   'lib/params.mjs': 'ff9abe2d6eca1b10460f4b74577ad56cfcc74fa2fa411903ee8cac9f18734058',
@@ -201,6 +201,9 @@ export function createTabNode({ base, snapshotUrl, blocksUrl, torrent = false, s
       return seedStop().then(async () => { if (!worker) throw new Error('the node is not running in this tab');
         try { return await once(); }
         catch { log('the node did not answer the wipe: stopping it and wiping from a fresh one', 'err'); try { worker.terminate(); } catch {} spawn();
-          try { return await once(); } catch { try { worker.terminate(); } catch {} worker = null; throw new Error('the node did not wipe in time, and nothing is pending: close the other tabs of this site and try again'); } } }); },
+          try { return await once(); } catch { try { worker.terminate(); } catch {} worker = null;
+            /* no node runs now: said as an error (phase 'error', node.error, an 'error' message), so a page does not go on showing a frozen node as live */
+            const text = 'the node did not wipe in time and is stopped: its files may be partly removed. Close the other tabs of this site and reload'; node.phase = 'error'; node.synced = false; node.error = text; sync('Error: ' + text, null);
+            const m = { type: 'error', text, fatal: true }; emit('error', m); emit('message', m); throw new Error('the node did not wipe in time, and nothing is pending: close the other tabs of this site and try again'); } } }); },
     seedSupported, workerSource: () => workerSource(base) };
 }

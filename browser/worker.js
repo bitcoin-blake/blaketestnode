@@ -6,7 +6,7 @@ import { buildIndexAsync, indexBytes, parseIndexBytes } from '../lib/packed.mjs'
 import { bytesToHex } from '../lib/bytes.mjs';
 import { PackedUtxo } from '../lib/packed.mjs';
 import { ChainNode, checkContextHeaders } from '../lib/node.mjs';
-import { fetchTip, subscribeTip, judgeTip as judge, servedDisagreement, rollbackAllowed, higherTip, nextVouched, vouchedUnder, tooNew } from '../lib/nip333.mjs';
+import { fetchTip, subscribeTip, judgeTip as judge, rollbackAllowed, higherTip, nextVouched, vouchedUnder, settleTip, keptTip, sourceVouched } from '../lib/nip333.mjs';
 import { buildTemplate, checkTemplate } from '../lib/template.mjs';
 import { makeWebMiner } from '../lib/webminer.mjs';
 const SIDESTR = 'https://cdn.jsdelivr.net/gh/sidestr/spec@cec654b7d06907130700fe52c66c3f9d0921495d/siding/lib';
@@ -234,19 +234,19 @@ function judgeTip() {
   const prev = chain.nostr; const next = { height: t.height, hash: t.hash, relay: t.relay, created_at: t.created_at, live: !!t.live, agree, diverged, aboveTip: chain.node.height - t.height, kept: t.relay === 'this tab (kept)', vouchedTo: chain.vouchedTo ?? null };
   if (!prev || prev.agree !== agree || prev.diverged !== diverged || prev.height !== next.height || prev.hash !== next.hash || prev.live !== next.live || prev.vouchedTo !== next.vouchedTo) { chain.nostr = next; post({ type: 'nostr', ...next }); }
 }
-// the served chain against the last signed headers this tab holds, before any rollback or apply: a block file that differs
-// from what the signed tip says is refused outright (neither rolled back to nor applied), not applied and flagged after
-async function servedAgainstTip() {
-  const t = chain.tipHeaders; if (!t?.hashes?.length || !chain.source) return;
-  const h = await servedDisagreement(t, (x) => chain.source.hash(x));
-  if (h != null) { setVouched(nextVouched(chain.vouchedTo, { firstDiverged: h })); chain.nostr = { height: t.height, hash: t.hash, relay: t.relay, created_at: t.created_at, live: !!t.live, agree: 0, diverged: true, vouchedTo: chain.vouchedTo ?? null }; post({ type: 'nostr', ...chain.nostr });
-    throw new Error(`block file disagrees with the NIP-333 headers at ${h}: nothing is applied or rolled back until they agree`); }
+// a signed tip the served chain disagrees with at `h`: said to the page, the vouched height capped below it, and the sync stopped
+// before any rollback or apply (a block file that differs from what the signed tip says is refused, not applied and flagged after)
+function refuseServed(t, h) {
+  setVouched(nextVouched(chain.vouchedTo, { firstDiverged: h })); chain.nostr = { height: t.height, hash: t.hash, relay: t.relay, created_at: t.created_at, live: !!t.live, agree: 0, diverged: true, vouchedTo: chain.vouchedTo ?? null }; post({ type: 'nostr', ...chain.nostr });
+  throw new Error(`block file disagrees with the NIP-333 headers at ${h}: nothing is applied or rolled back until they agree`);
 }
+// the real time as this tab best knows it: its clock less the skew the page measured (seconds, + when this clock is fast)
+const realNow = () => Date.now() - (chain.skewS ?? 0) * 1000;
 const tipFrom = (t, k, live) => ({ height: t.height, hash: t.hash, relay: t.relay, created_at: t.created_at, live, first: t.first, hashes: (t.headers ?? []).map((x) => k.codec.blockHash(x)) });
 // the signed tip this tab holds the chain to: never lowered by an older event or by none at all, and kept between sessions
 // (tip.json), so a relay that hands an old genuine tip cannot lower the floor the served chain and rollbacks are held to
 async function setTip(t) {
-  const prev = chain.tipHeaders; if (!t || higherTip(prev, t) !== t) return; /* an older word than the one held: kept as it is */
+  const prev = chain.tipHeaders; if (!t || higherTip(prev, t, realNow()) !== t) return; /* an older word than the one held: kept as it is */
   chain.tipHeaders = t;
   const v = vouchedUnder(chain.vouchedTo, t); if (v !== (chain.vouchedTo ?? null)) { chain.vouchedTo = v; return saveTip(); } /* not vouched above what the publisher now signs */
   if (!prev || t.height !== prev.height || t.hash !== prev.hash) await saveTip();
@@ -254,8 +254,7 @@ async function setTip(t) {
 // tip.json: the signed headers this tab holds the chain to, and how far its applied chain has been vouched for by them
 const saveTip = async () => { const t = chain.tipHeaders; if (!t) return; try { await writeSmall('tip.json', JSON.stringify({ height: t.height, hash: t.hash, first: t.first, hashes: t.hashes, created_at: t.created_at, vouchedTo: chain.vouchedTo ?? null, source: chain.blocksUrl ?? null })); } catch {} };
 function setVouched(v) { if (v === (chain.vouchedTo ?? null)) return; chain.vouchedTo = v; saveTip(); }
-async function loadTip() { if (chain.tipHeaders) return; try { const j = JSON.parse((await readSmall('tip.json')) ?? 'null'); if (j?.hashes?.length && j.first + j.hashes.length - 1 === j.height && !tooNew(j.created_at)) { chain.tipHeaders = { ...j, live: false, relay: 'this tab (kept)' };
-  /* a vouched height counted against another block source is not this one's: counted again from the signed headers */ chain.vouchedTo = Number.isInteger(j.vouchedTo) && (j.source == null || j.source === chain.blocksUrl) ? vouchedUnder(j.vouchedTo, j) : null; } } catch {} }
+async function loadTip() { if (chain.tipHeaders) return; try { const kept = keptTip(JSON.parse((await readSmall('tip.json')) ?? 'null'), chain.blocksUrl, realNow()); if (kept) { chain.tipHeaders = kept.tip; chain.vouchedTo = kept.vouchedTo; } } catch {} }
 async function sync(blocksUrl, { noScripts = false } = {}) {
   if (chain.syncing) return; chain.syncing = true; chain.syncAbort = new AbortController();
   const t0 = performance.now();
@@ -263,13 +262,24 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     const { k, nostr } = await loadEngine();
     if (noScripts) k.blocks.interpreter = null;
     const utxo = await loadSet();
-    if (chain.blocksUrl && chain.blocksUrl !== blocksUrl && chain.vouchedTo != null) { chain.blocksUrl = blocksUrl; setVouched(null); } /* another block source: nothing it serves is vouched for yet */
-    chain.blocksUrl = blocksUrl;
+    const v = sourceVouched(chain.blocksUrl, blocksUrl, chain.vouchedTo); chain.blocksUrl = blocksUrl; if (v !== (chain.vouchedTo ?? null)) setVouched(v); /* another block source: nothing it serves is vouched for yet */
     chain.source ??= new OpfsBlockSource(k, blocksUrl, files, { log, signal: () => chain.syncAbort?.signal ?? null });
     await loadTip();
     const u = await chain.source.update();
     post({ type: 'blockfile', ...u });
-    await servedAgainstTip();
+    // the live signed tip, heard from the first sync on, before anything here can stop it: a sync refused by a kept tip the chain
+    // has moved past still hears the publisher's next word
+    chain.tipSub ??= await subscribeTip(k, CHAIN.nip333, async (t) => { chain.tipAt = Date.now(); /* an older event replayed by a relay is refused by setTip (older created_at) */ await setTip(tipFrom(t, k, true)); judgeTip(); if (!chain.node || t.height > chain.node.height) setTimeout(() => queueSync(), 3000); }, { nostr, log, skewS: () => chain.skewS ?? 0 });
+    // the relays' word on the tip: fetched on the first sync, then only when the live subscription has said nothing for ten
+    // minutes (a fetch opens a socket per relay; every 30 s that is thousands a day), or at most once a minute when the tip held
+    // disagrees with the served chain. The later word of the held and the fetched tip is held against the served chain, before
+    // any rollback or apply
+    const due = !chain.tipAt || Date.now() - chain.tipAt > 600_000, mayForce = !chain.forcedAt || Date.now() - chain.forcedAt > 60_000;
+    const st = await settleTip({ held: chain.tipHeaders, due, mayForce, served: (x) => chain.source.hash(x), nowMs: realNow(),
+      fetch: async () => { const nip = await fetchTip(k, CHAIN.nip333, { nostr, held: chain.tipHeaders, nowMs: realNow }); return nip ? tipFrom(nip, k, false) : null; } });
+    if (st.fetched) { chain.tipAt = Date.now(); if (!due) chain.forcedAt = Date.now(); }
+    if (st.tip && st.tip !== chain.tipHeaders) await setTip(st.tip);
+    if (st.at != null) refuseServed(st.tip, st.at);
     const epochStart = Math.floor(SNAPSHOT.baseHeight / CHAIN.retargetInterval) * CHAIN.retargetInterval;
     if (!chain.node) {
       const ctx = await chain.source.contextHeaders(blocksUrl.replace(/-blocks$/, '-context-headers.json'), { from: epochStart, to: SNAPSHOT.baseHeight });
@@ -290,17 +300,7 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
       if (replayed) log(`replayed ${replayed} blocks from this tab's delta log`);
       if (chain.vouchedTo != null && chain.vouchedTo > chain.node.height) setVouched(chain.node.height); /* the log broke off: what is applied again is vouched again */
     }
-    // the relays' word on the tip, checked against the file's tail: fetched on the first sync, then only when the live
-    // subscription has said nothing for ten minutes (a fetch opens a socket per relay; every 30 s that is thousands a day)
-    const nip = !chain.tipAt || Date.now() - chain.tipAt > 600_000 ? await fetchTip(k, CHAIN.nip333, { nostr }) : null;
-    if (!chain.tipAt || Date.now() - chain.tipAt > 600_000) chain.tipAt = Date.now();
-    if (nip) {
-      const fresh = tipFrom(nip, k, false);
-      for (let i = 0; i < nip.headers.length; i++) { const h = nip.first + i; const have = await chain.source.hash(h);
-        if (have && have !== fresh.hashes[i]) { setVouched(nextVouched(chain.vouchedTo, { firstDiverged: h })); chain.nostr = { height: nip.height, hash: nip.hash, relay: nip.relay, created_at: nip.created_at, agree: 0, diverged: true, vouchedTo: chain.vouchedTo ?? null }; post({ type: 'nostr', ...chain.nostr }); throw new Error(`block file disagrees with the NIP-333 headers at ${h}`); } }
-      await setTip(fresh);
-      judgeTip();
-    }
+    judgeTip();
     // rollback if the served chain diverged from what we applied
     let common = chain.node.height;
     while (common > SNAPSHOT.baseHeight && (await chain.source.hash(common)) !== chain.node.chain[common]) common--;
@@ -324,7 +324,6 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     if (!chain.timer) {
       chain.timer = setInterval(() => queueSync(), 30_000);
       chain.noScripts = noScripts;
-      chain.tipSub = await subscribeTip(k, CHAIN.nip333, async (t) => { chain.tipAt = Date.now(); /* an older event replayed by a relay is refused by setTip (older created_at) */ await setTip(tipFrom(t, k, true)); judgeTip(); if (t.height > chain.node.height) setTimeout(() => queueSync(), 3000); }, { nostr, log, skewS: () => chain.skewS ?? 0 });
     }
   } finally { chain.syncing = false; chain.syncAbort = null; }
 }
