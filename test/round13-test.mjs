@@ -65,7 +65,7 @@ const served = (h) => (h < 1000 ? H(h, 'c') : H(h, 'b'));
 { // the worker and the loader call these, read as text (they run only in a browser)
   const w = readFileSync(new URL('../browser/worker.js', import.meta.url), 'utf8'), l = readFileSync(new URL('../browser/tabnode.js', import.meta.url), 'utf8');
   const sync = w.slice(w.indexOf('async function sync('), w.indexOf('// rollback if the served chain diverged'));
-  t('the worker settles the tip with settleTip before any rollback or apply, and subscribes before it', /settleTip\(\{ held: chain\.tipHeaders/.test(sync) && sync.indexOf('chain.tipSub ??= await subscribeTip') < sync.indexOf('settleTip(') && sync.indexOf('settleTip(') < sync.indexOf('new ChainNode'));
+  t('the worker settles the tip (settleOrRefuse, over settleTip) before any rollback or apply, and subscribes before it', /settleOrRefuse\(\{ held: chain\.tipHeaders/.test(sync) && sync.indexOf('chain.tipSub ??= await subscribeTip') < sync.indexOf('settleOrRefuse(') && sync.indexOf('settleOrRefuse(') < sync.indexOf('new ChainNode'));
   t('...fetching with the tip held and the real time; tip.json through keptTip; a source change through sourceVouched', /fetchTip\(k, CHAIN\.nip333, \{ nostr, held: chain\.tipHeaders, nowMs: realNow \}\)/.test(w) && /keptTip\(JSON\.parse\(.*\), chain\.blocksUrl, realNow\(\)\)/.test(w) && /sourceVouched\(chain\.blocksUrl, blocksUrl, chain\.vouchedTo\)/.test(sync));
   t('a wipe that fails says so: phase error, an error message, nothing left looking live', /node\.phase = 'error'; node\.synced = false; node\.error = text/.test(l) && /type: 'error', text, fatal: true/.test(l));
 }
