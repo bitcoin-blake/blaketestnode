@@ -89,7 +89,7 @@ const never = async () => { throw new Error('not asked'); };
   const at = (re) => { const m = re.exec(sync); return m ? m.index : -1; };
   const plan = at(/await applyPlan\(chain, plan, \{ take: setTip, retry: \(ms\) => \{ clearTimeout\(chain\.retryTimer\); chain\.retryTimer = setTimeout\(/), refuse = at(/refuse: refuseServed \}\);/), settle = at(/const plan = await settleOrRefuse\(/);
   t('the worker applies the plan through applyPlan (the times, the tip, a refusal with its retry), right after settling it', settle >= 0 && plan >= 0 && refuse >= 0 && settle < plan && plan < refuse);
-  t('...the live callback goes through liveTipOn with setTip; a wipe clears the retry', /liveTipOn\(chain, tipFrom\(t, k, true\), \{ take: setTip, judge: judgeTip, later: /.test(sync) && /m\.type === 'wipe'\) \{[^\n]*clearTimeout\(chain\.retryTimer\)/.test(w));
+  t('...the live callback goes through liveTipOn with setTip; a wipe clears the retry', /liveTipOn\(chain, tipFrom\(t, k, true\), \{ take: setTip, judge: judgeTip, later: /.test(sync) && /m\.type === 'wipe'\) \{ stopForWipe\(chain\);/.test(w));
   t('a request\'s error names the request; the loader does not take it for the node\'s state unless the node\'s files failed', /\.\.\.\(m\.req != null \? \{ req: m\.req \} : \{\}\)/.test(w) && /node\.synced && !storageFault\(m\) && \(m\.req != null \|\|/.test(l));
 }
 console.log(`\n${ok} passed, ${bad} failed`); process.exit(bad ? 1 : 0);

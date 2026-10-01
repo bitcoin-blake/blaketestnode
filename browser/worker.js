@@ -6,7 +6,7 @@ import { buildIndexAsync, indexBytes, parseIndexBytes } from '../lib/packed.mjs'
 import { bytesToHex } from '../lib/bytes.mjs';
 import { PackedUtxo } from '../lib/packed.mjs';
 import { ChainNode, checkContextHeaders } from '../lib/node.mjs';
-import { fetchTip, subscribeTip, judgeTip as judge, rollbackAllowed, nextVouched, keptTip, sourceVouched, realNowFor, setTipOn, liveTipOn, applyPlan, settleOrRefuse } from '../lib/nip333.mjs';
+import { fetchTip, subscribeTip, judgeTip as judge, rollbackAllowed, nextVouched, keptTip, sourceVouched, realNowFor, setTipOn, liveTipOn, applyPlan, settleOrRefuse, stopForWipe, forgetForWipe, maySync, mayArm, maySubscribe } from '../lib/nip333.mjs';
 import { buildTemplate, checkTemplate } from '../lib/template.mjs';
 import { makeWebMiner } from '../lib/webminer.mjs';
 const SIDESTR = 'https://cdn.jsdelivr.net/gh/sidestr/spec@cec654b7d06907130700fe52c66c3f9d0921495d/siding/lib';
@@ -169,8 +169,7 @@ async function wipe() {
   try { for await (const [name] of d.entries()) names.push(name); } catch { names = [SNAPSHOT.file, `${SNAPSHOT.file}.idx`, `${SNAPSHOT.file}.sha256`, `${SNAPSHOT.file}.ranges`, `${SNAPSHOT.file}.part`, 'blocks.dat', 'blocks.json', 'deltas.json', 'tip.json', 'context-headers.json', `context-headers-${SNAPSHOT.baseHeight}.json`]; }
   const removed = [], failed = [];
   for (const n of names) { try { await d.removeEntry(n, { recursive: true }); removed.push(n); } catch (e) { if (e?.name !== 'NotFoundError') failed.push(`${n}: ${e.message}`); } }
-  layoutChecked = false; clearInterval(chain.timer); clearTimeout(chain.retryTimer);
-  Object.assign(chain, { node: null, utxo: null, source: null, bytes: null, deltas: [], cpuAbort: null, timer: null, retryTimer: null, blocksUrl: null, tipAt: null, forcedAt: null, refusedN: 0 });
+  layoutChecked = false; forgetForWipe(chain);
   post({ type: 'wiped', removed, failed });
 }
 
@@ -265,7 +264,7 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     post({ type: 'blockfile', ...u });
     // the live signed tip, heard from the first sync on, before anything here can stop it: a sync refused by a kept tip the chain
     // has moved past still hears the publisher's next word
-    if (!chain.tipSub && !chain.wiped) { /* an older event replayed by a relay is refused by setTip (older created_at), and moves nothing */
+    if (maySubscribe(chain)) { /* an older event replayed by a relay is refused by setTip (older created_at), and moves nothing */
       const sub = await subscribeTip(k, CHAIN.nip333, (t) => liveTipOn(chain, tipFrom(t, k, true), { take: setTip, judge: judgeTip, later: () => setTimeout(() => queueSync(), 3000) }), { nostr, log, skewS: () => chain.skewS ?? 0 });
       if (chain.wiped) sub.close(); else chain.tipSub = sub; }
     // the relays' word on the tip: fetched on the first sync, then only when the live subscription has said nothing for ten
@@ -317,7 +316,7 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     judgeTip();
     if (applied && chain.miner) { if (chain.solo) soloWork(`tip ${chain.node.height}`); else newWork(`tip ${chain.node.height}`); }
     post({ type: 'synced', aboveTip: chain.tipHeaders ? chain.node.height - chain.tipHeaders.height : null, height: chain.node.height, hash: chain.node.tipHash(), time: chain.node.headers[chain.node.height]?.time ?? null, coins: utxo.size, applied, txs, ms: performance.now() - t0, stats: chain.node.stats, scripts: !noScripts, quiet: applied === 0 && !!chain.timer });
-    if (!chain.timer && !chain.wiped) {
+    if (mayArm(chain)) {
       chain.timer = setInterval(() => queueSync(), 30_000);
       chain.noScripts = noScripts;
     }
@@ -338,7 +337,7 @@ async function coin(key) {
 
 // a sync from the timer or a tip is queued only when none is queued or running already: on a slow link they would pile up
 // and keep the wallet's lookups waiting behind them
-function queueSync() { if (chain.syncing || chain.syncQueued || !chain.blocksUrl || chain.wiped) return; chain.syncQueued = true; enqueue(() => { chain.syncQueued = false; return withSnapshot(() => sync(chain.blocksUrl, { noScripts: !!chain.noScripts })); }); }
+function queueSync() { if (!maySync(chain)) return; chain.syncQueued = true; enqueue(() => { chain.syncQueued = false; return withSnapshot(() => sync(chain.blocksUrl, { noScripts: !!chain.noScripts })); }); }
 // a lookup reads only blocks this node applied (the served file can be ahead of, or on another branch than, what was validated)
 const applied = (h) => { const e = chain.source?.byHeight?.get(h); return e && chain.node && e.hash === chain.node.chain[h] ? e : null; };
 // one job at a time: every job opens OPFS handles, and two jobs interleaving at an await
@@ -352,7 +351,7 @@ self.onmessage = (e) => { const m = e.data;
   if (m.type === 'ping') return post({ type: 'pong', t: m.t ?? null }); /* answered at once, outside the queue: the page's proof that the node is alive */
   if (m.type === 'skew') { chain.skewS = Number.isFinite(Number(m.s)) ? Number(m.s) : 0; return; } /* the page's measure of this clock against the real one, in seconds: the live tip's look-back */
   if (m.type === 'wake') { chain.tipSub?.reopen(); chain.mempoolSub?.reopen(); chain.beat?.(); if (chain.syncing) chain.syncAbort?.abort(quiet('the page woke: a fresh sync replaces the one in flight')); }
-  else if (m.type === 'wipe') { chain.wiped = true; /* nothing started from here on re-arms a timer or a sync, until the page asks for a sync again */ if (chain.timer) { clearInterval(chain.timer); chain.timer = null; } clearTimeout(chain.retryTimer); chain.retryTimer = null; chain.refusedN = 0; clearInterval(chain.feedTimer); chain.tipHeaders = null; chain.vouchedTo = null; chain.beat = null; chain.syncAbort?.abort(quiet('wiping')); chain.fetchAbort.abort(quiet('wiping')); chain.cpuAbort = quiet('wiping'); try { chain.tipSub?.close(); chain.mempoolSub?.close(); chain.miner?.close?.(); } catch {} chain.tipSub = chain.mempoolSub = chain.miner = null; }
+  else if (m.type === 'wipe') { stopForWipe(chain); chain.syncAbort?.abort(quiet('wiping')); chain.fetchAbort.abort(quiet('wiping')); chain.cpuAbort = quiet('wiping'); try { chain.tipSub?.close(); chain.mempoolSub?.close(); chain.miner?.close?.(); } catch {} chain.tipSub = chain.mempoolSub = chain.miner = null; }
   enqueue(() => handle(m)); };
 let reseeding = false;
 // the files' layout, read once: absent is written as this node's; newer stops everything but a wipe
