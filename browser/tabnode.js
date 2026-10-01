@@ -42,6 +42,44 @@ function opfsStoreClass(rpc) { return class { constructor(chunkLength, opts) { t
   close(cb = () => {}) { cb(null); } destroy(cb = () => {}) { cb(null); } }; }
 const torrentFileUrl = (snapshotUrl) => snapshotUrl.replace(/\.dat$/, '') + '.torrent';
 
+// ---- the node's own code by content as well as by commit: sha256 of every file of this repository the worker loads, at the
+// commit that holds this table (tools/integrity.mjs writes it; test/integrity-test.mjs checks it against the files)
+// INTEGRITY:BEGIN
+export const CODE_SHA256 = {
+  'browser/blocks.js': 'd64c9d892a979502111c9ea1cf06ad7a588cd3b6e6d1e1dbb2d9f670de481573',
+  'browser/worker.js': 'a20a38434823e40266a617f612e1148bd1858fd45e7360ee1842d15814188c97',
+  'lib/bytes.mjs': 'c03070261249baaab1475caa4bf34f40c81556bc5fff97817c69951a356439d3',
+  'lib/mempool.mjs': '9222d51d073674901fb935217697f3fea2a25f4f90a41f6b927677f6a1c640dd',
+  'lib/nip333.mjs': '0e481426af4e98f1974684db90e7609f98da81d639e4c919f1a5a29aca0b2b8d',
+  'lib/node.mjs': 'ac395210ef0d6bf65160b50f7189984e8ba412aefd7768d0bdf584deda29f674',
+  'lib/packed.mjs': 'bf79465a5bf4bfcbbec600d8f42b3ded81f1daf8a065ea95c4c08977460ceb3c',
+  'lib/params.mjs': 'ff9abe2d6eca1b10460f4b74577ad56cfcc74fa2fa411903ee8cac9f18734058',
+  'lib/sha256.mjs': '5150a47ad64ba86f527858f432bda497742b0548f71a3fbc1b0e1b1d04bbb9ce',
+  'lib/snapshot.mjs': '944194abbaba8786a786acebfc0ecae060a12899f5c96985a824cbe3c87a12e4',
+  'lib/template.mjs': 'fbe4be2c74580be3ab73238ecfe40f4908f52e2fc7a6250ab6da7dd7b9c77c94',
+  'lib/varint.mjs': '6faaf5287e86853ef5ebf334b547695e696b4b5a80eba267e3f5383e5f9a161b',
+  'lib/webminer.mjs': 'b1a7f5d582b5e1349a807a6438965a387f6cf5a3e878238f96f7e5a04c3d2998',
+};
+// INTEGRITY:END
+async function sha256hex(text) { const b = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))); return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join(''); }
+// fetch `path` (relative to the repository at `base`), check it, bring in its relative imports the same way (as blob URLs),
+// and give back its text with those imports pointing at the checked copies. Imports of other repositories (the engine,
+// sidestr) stay as they are: pinned by commit, and the engine's rule files are checked by hash in the worker.
+export async function workerSource(base, { entry = 'browser/worker.js', fetchText = null } = {}) {
+  const host = base.replace(/^https?:\/\//, '').split('/')[0]; const blobs = new Map();
+  const get = fetchText ?? (async (path) => { let r; try { r = await fetch(`${base}/${path}`, { signal: timeoutSignal(30_000) }); } catch (e) { throw new Error(`the node's code could not be loaded from ${host} (${e?.name === 'TimeoutError' || e?.name === 'AbortError' ? 'no answer in 30 s' : e.message}): check the connection and reload`); } if (!r.ok) throw new Error(`the node's code could not be loaded from ${host} (${path} answered ${r.status}): check the connection and reload`); return r.text(); });
+  const resolve = (from, rel) => { const parts = from.split('/').slice(0, -1); for (const p of rel.split('/')) { if (p === '..') parts.pop(); else if (p !== '.') parts.push(p); } return parts.join('/'); };
+  const load = async (path, top) => {
+    if (blobs.has(path)) return blobs.get(path);
+    const text = await get(path); const want = CODE_SHA256[path];
+    if (!want) throw new Error(`the node's ${path} is not in this loader's table of checked files: nothing was started`);
+    if ((await sha256hex(text)) !== want) throw new Error(`the node's ${path} from ${host} is not the pinned file (its sha256 differs): nothing was started`);
+    let out = text; for (const m of [...text.matchAll(/from '(\.{1,2}\/[^']+)'/g)]) { const dep = resolve(path, m[1]); out = out.split(`from '${m[1]}'`).join(`from '${await load(dep, false)}'`); }
+    if (top) return out;
+    const url = URL.createObjectURL(new Blob([out], { type: 'text/javascript' })); blobs.set(path, url); return url;
+  };
+  return load(entry, true);
+}
 export function createTabNode({ base, snapshotUrl, blocksUrl, torrent = false, seed = false, wtUrl = WT_URL, coins = 14200000 }) {
   const node = { phase: 'starting', st: null, height: null, hash: null, time: null, coins: null, txids: null, hs: null, hsOk: null, sha: null, hist: [], nostr: null, recv: 0, sent: 0, synced: false, fetchT0: 0, verifyT0: 0, syncT0: 0, lastSync: null, error: null, peers: null, mempool: null };
   const opts = { torrent, seed };
@@ -100,7 +138,7 @@ export function createTabNode({ base, snapshotUrl, blocksUrl, torrent = false, s
   // the first catch-up (before 'synced', when the worker has no timer of its own) is retried too: at once on wake, and after
   // a network error by itself with a growing wait (5 s … 5 min)
   let retryTimer = null, retryN = 0;
-  const retrySync = () => { clearTimeout(retryTimer); retryTimer = null; node.lastError = { text: node.error, at: Date.now() }; node.error = null; log('looking for the blocks again'); startSync(); };
+  const retrySync = () => { clearTimeout(retryTimer); retryTimer = null; node.retryAt = null; node.lastError = { text: node.error, at: Date.now() }; node.error = null; log('looking for the blocks again'); startSync(); };
   let hiddenAt = null; const wake = () => { if (!worker) return; if (node.phase === 'fetch' && node.error && !swarm) { clearTimeout(retryTimer); retryTimer = null; node.lastError = { text: node.error, at: Date.now() }; node.error = null; log('the connection is back: resuming the snapshot'); plainFetch(); } else if (node.phase === 'sync' && node.error && !node.synced) retrySync(); else if (node.synced) post({ type: 'wake' }); };
   globalThis.document?.addEventListener?.('visibilitychange', () => { if (document.visibilityState === 'hidden') hiddenAt = Date.now(); else { if (hiddenAt && Date.now() - hiddenAt > 60_000) wake(); hiddenAt = null; } });
   addEventListener('online', wake);
@@ -109,26 +147,29 @@ export function createTabNode({ base, snapshotUrl, blocksUrl, torrent = false, s
 
   // a worker that died (memory pressure on a phone) or hangs says nothing: a ping every 30 s, answered outside its queue; two
   // minutes without an answer is said as an error the page shows, and cleared when it answers again
-  let lastPong = Date.now(); const UNRESPONSIVE = 'the node has stopped answering (its worker may have been stopped by the browser): reload the page';
-  const pinger = setInterval(() => { if (!worker) return; post({ type: 'ping', t: Date.now() });
-    if (Date.now() - lastPong > 120_000 && !node.unresponsive) { node.unresponsive = true; node.error = UNRESPONSIVE; sync('Error: ' + UNRESPONSIVE, null); log(UNRESPONSIVE, 'err'); emit('unresponsive', {}); emit('message', { type: 'unresponsive' }); } }, 30_000); pinger.unref?.();
+  // unresponsive is a state, not a stop: node.unresponsive is set and node.error carries UNRESPONSIVE (pages show it as a warning);
+  // a page that was itself paused (asleep, a frozen background tab) does not count the pause against the worker
+  let lastPong = Date.now(), lastPing = Date.now(); const UNRESPONSIVE = 'the node has not answered for two minutes (its worker may have been stopped by the browser): reload the page if it does not come back';
+  const pinger = setInterval(() => { if (!worker) return; const now = Date.now(); const paused = now - lastPing > 60_000; lastPing = now; if (paused) { lastPong = now; post({ type: 'ping', t: now }); return; } post({ type: 'ping', t: now });
+    if (now - lastPong > 120_000 && !node.unresponsive) { node.unresponsive = true; node.error = UNRESPONSIVE; sync(UNRESPONSIVE, null); log(UNRESPONSIVE, 'err'); emit('unresponsive', {}); emit('message', { type: 'unresponsive' }); } }, 30_000); pinger.unref?.();
   // ---- the worker's messages: the loader takes the phases, the page gets every message after
   function onMessage(e) { const m = e.data;
-    if (m.type === 'pong') { lastPong = Date.now(); if (node.unresponsive) { node.unresponsive = false; if (node.error === UNRESPONSIVE) node.error = null; log('the node answers again'); } return; }
+    if (m.type === 'pong') { lastPong = Date.now(); if (node.unresponsive) { node.unresponsive = false; if (node.error === UNRESPONSIVE) node.error = null; log('the node answers again'); sync(node.synced ? `Up to date · ${n(node.height)}` : 'the node answers again', null); emit('responsive', {}); emit('message', { type: 'responsive' }); } return; }
     if (m.type === 'status') { const first = !node.st; node.st = m; if (!first) seedStart(); if (first) { if (m.dat < m.expect.bytes) { if (opts.torrent) swarmFetch(m); else plainFetch(); } else if (!m.sha) hashPhase(); else if (m.idx <= 0) { seedStart(); verifyPhase(); } else { seedStart(); startSync(); } } }
-    else if (m.type === 'fetch') { node.recv = m.have; sync(`Synchronizing with network… fetching the UTXO snapshot (${mib(m.have)} of ${mib(m.total)}, ${(m.rate / 1048576).toFixed(1)} MiB/s)`, m.have / m.total * 100, eta(m.have, m.total, node.fetchT0)); }
+    else if (m.type === 'fetch') { retryN = 0; node.retryAt = null; node.recv = m.have; sync(`Synchronizing with network… fetching the UTXO snapshot (${mib(m.have)} of ${mib(m.total)}, ${(m.rate / 1048576).toFixed(1)} MiB/s)`, m.have / m.total * 100, eta(m.have, m.total, node.fetchT0)); }
     else if (m.type === 'hashing') { sync(`Checking the snapshot's sha256… ${mib(m.at)} of ${mib(m.total)}`, m.at / m.total * 100, ''); }
-    else if (m.type === 'fetched') { retryN = 0; if (m.ms) hist('fetch the snapshot', m.ms); hist('check the sha256', Math.max(0, performance.now() - node.fetchT0 - (m.ms || 0))); if (!m.ok) { node.error = 'the snapshot\'s sha256 does not match the pinned value'; sync('Snapshot hash MISMATCH: the file is not the one the node expects', null); } else { node.sha = m.sha256; if (node.st) node.st.sha = m.sha256; seedStart(); verifyPhase(); } }
+    else if (m.type === 'fetched') { retryN = 0; node.retryAt = null; if (m.ms) hist('fetch the snapshot', m.ms); hist('check the sha256', Math.max(0, performance.now() - node.fetchT0 - (m.ms || 0))); if (!m.ok) { node.error = 'the snapshot\'s sha256 does not match the pinned value'; sync('Snapshot hash MISMATCH: the file is not the one the node expects', null); } else { node.sha = m.sha256; if (node.st) node.st.sha = m.sha256; seedStart(); verifyPhase(); } }
     else if (m.type === 'parsing') { sync(`Verifying the snapshot… ${m.text.trim()}`, null); }
+    else if (m.type === 'verified' && (node.phase === 'sync' || node.phase === 'synced')) { node.coins = m.coins ?? node.coins; /* an index rebuilt during a sync: the sync goes on, it is not started again */ }
     else if (m.type === 'verified') { hist('parse, hash and index the snapshot', m.ms); node.coins = m.coins; node.txids = m.txids; node.hs = m.hashSerialized; node.hsOk = m.ok; if (!m.ok) { node.error = 'hash_serialized_3 mismatch'; sync('Snapshot verification FAILED: hash_serialized_3 does not match', null); } else startSync(); }
     else if (m.type === 'blockfile') { node.recv += m.fetched || 0; }
-    else if (m.type === 'progress') { const done = m.applied, total = Math.max(1, m.to - (m.height - m.applied)); sync(`Synchronizing with network… block ${n(m.height)} of ${n(m.to)} (${n(m.to - m.height)} remaining)`, done / total * 100, eta(done, total, node.syncT0)); node.height = m.height; node.coins = m.coins ?? node.coins; }
-    else if (m.type === 'synced') { retryN = 0; clearTimeout(retryTimer); retryTimer = null; if (node.error && !/mismatch|FAILED/i.test(node.error)) { node.lastError = { text: node.error, at: Date.now() }; node.error = null; } if (!node.synced) hist(`validate ${n(m.applied)} blocks to the tip`, m.ms); node.synced = true; node.phase = 'synced'; node.height = m.height; node.hash = m.hash; node.time = m.time; node.lastSync = Date.now(); sync(m.applied ? `Up to date · ${n(m.height)} · ${m.applied} block${m.applied === 1 ? '' : 's'} validated` : `Up to date · ${n(m.height)}`, null); }
+    else if (m.type === 'progress') { retryN = 0; node.retryAt = null; const done = m.applied, total = Math.max(1, m.to - (m.height - m.applied)); sync(`Synchronizing with network… block ${n(m.height)} of ${n(m.to)} (${n(m.to - m.height)} remaining)`, done / total * 100, eta(done, total, node.syncT0)); node.height = m.height; node.coins = m.coins ?? node.coins; }
+    else if (m.type === 'synced') { retryN = 0; node.retryAt = null; clearTimeout(retryTimer); retryTimer = null; if (node.error && !/mismatch|FAILED/i.test(node.error)) { node.lastError = { text: node.error, at: Date.now() }; node.error = null; } if (!node.synced) hist(`validate ${n(m.applied)} blocks to the tip`, m.ms); node.synced = true; node.phase = 'synced'; node.height = m.height; node.hash = m.hash; node.time = m.time; node.lastSync = Date.now(); sync(m.applied ? `Up to date · ${n(m.height)} · ${m.applied} block${m.applied === 1 ? '' : 's'} validated` : `Up to date · ${n(m.height)}`, null); }
     else if (m.type === 'nostr') { node.nostr = m; }
     else if (m.type === 'mempool') { node.mempool = m; }
     else if (m.type === 'error') { const lookup = node.synced && /Block not found|sync first|not in the set|not in mempool/.test(m.text); if (!lookup) { node.error = m.text; sync('Error: ' + m.text.slice(0, 140), null); }
-      if (!lookup && node.phase === 'fetch' && !swarm && NETWORK.test(m.text) && !retryTimer) { const wait = Math.min(300_000, 5000 * 2 ** retryN++); log(`the snapshot's source did not answer: the fetch resumes in ${Math.round(wait / 1000)} s`); retryTimer = setTimeout(() => { retryTimer = null; node.lastError = { text: node.error, at: Date.now() }; node.error = null; plainFetch(); }, wait); }
-      if (!lookup && node.phase === 'sync' && !node.synced && NETWORK.test(m.text) && !retryTimer) { const wait = Math.min(300_000, 5000 * 2 ** retryN++); log(`the block source did not answer: trying again in ${Math.round(wait / 1000)} s`); retryTimer = setTimeout(retrySync, wait); } log((lookup ? '' : 'node error: ') + m.text.replace(/ @ .*$/, '') + (lookup ? ' (code -5)' : ''), 'err'); }
+      if (!lookup && node.phase === 'fetch' && !swarm && NETWORK.test(m.text) && !retryTimer) { const wait = Math.min(300_000, 5000 * 2 ** retryN++); log(`the snapshot's source did not answer: the fetch resumes in ${Math.round(wait / 1000)} s`); node.retryAt = Date.now() + wait; retryTimer = setTimeout(() => { retryTimer = null; node.retryAt = null; node.lastError = { text: node.error, at: Date.now() }; node.error = null; plainFetch(); }, wait); }
+      if (!lookup && node.phase === 'sync' && !node.synced && NETWORK.test(m.text) && !retryTimer) { const wait = Math.min(300_000, 5000 * 2 ** retryN++); log(`the block source did not answer: trying again in ${Math.round(wait / 1000)} s`); node.retryAt = Date.now() + wait; retryTimer = setTimeout(retrySync, wait); } log((lookup ? '' : 'node error: ') + m.text.replace(/ @ .*$/, '') + (lookup ? ' (code -5)' : ''), 'err'); }
     else if (m.type === 'log') { log(m.text); }
     if (m.type !== 'log') emit(m.type, m); emit('message', m); } // 'log' is the loader's own event above, so a worker log line is not delivered twice
 
@@ -140,9 +181,9 @@ export function createTabNode({ base, snapshotUrl, blocksUrl, torrent = false, s
   let workerSrc = null;
   const spawn = () => { worker = new Worker(URL.createObjectURL(new Blob([workerSrc], { type: 'text/javascript' })), { type: 'module' }); worker.onmessage = onMessage; worker.onerror = (e) => { node.error = e.message || 'worker failed'; sync('Error: ' + node.error, null); log('worker error: ' + node.error, 'err'); }; lastPong = Date.now(); };
   async function startWorker() {
-    // the node's code from the CDN: a hang or an error page would otherwise become a worker that never speaks, or a syntax error
-    let src; try { const r = await fetch(`${base}/browser/worker.js`, { signal: timeoutSignal(30_000) }); if (!r.ok) throw new Error(`answered ${r.status}`); src = await r.text(); }
-    catch (e) { throw new Error(`the node's code could not be loaded from ${base.replace(/^https?:\/\//, '').split('/')[0]} (${e?.name === 'TimeoutError' || e?.name === 'AbortError' ? 'no answer in 30 s' : e.message}): check the connection and reload`); } workerSrc = src.replace(/from '\.\.\/lib\//g, `from '${base}/lib/`).replace(/from '\.\/blocks\.js'/g, `from '${base}/browser/blocks.js'`);
+    // the node's code from the CDN, each file checked against the hashes this loader carries (a CDN serving other code would
+    // run another node beside the wallet's key): a hang, an error page or a changed file stops here, said in words
+    workerSrc = await workerSource(base);
     spawn();
     sync('Starting the node…', null); log('loading the node from ' + base.replace('https://cdn.jsdelivr.net/gh/', '')); post({ type: 'status' }); return true; }
 
@@ -159,5 +200,5 @@ export function createTabNode({ base, snapshotUrl, blocksUrl, torrent = false, s
         try { return await once(); }
         catch { log('the node did not answer the wipe: stopping it and wiping from a fresh one', 'err'); try { worker.terminate(); } catch {} spawn();
           try { return await once(); } catch { try { worker.terminate(); } catch {} worker = null; throw new Error('the node did not wipe in time, and nothing is pending: close the other tabs of this site and try again'); } } }); },
-    seedSupported };
+    seedSupported, workerSource: () => workerSource(base) };
 }

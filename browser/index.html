@@ -73,7 +73,24 @@ if (lockState !== 'held') {
   document.querySelector('.sub').className = 'sub warn';
   throw new Error('idle: ' + lockState);
 }
-const worker = new Worker('./worker.js', { type: 'module' });
+// the node the apps of this origin run, not this repository's newest commit: two node versions on the same files would fight
+// over their formats. The pin is read from Reef's published page, and the worker comes through that commit's loader, which
+// checks every file by hash; without the pin this page does not start
+let worker;
+try {
+  const reef = await (await fetch('/reef/reef.js', { cache: 'no-cache' })).text();
+  const pin = reef.match(/blaketestnode@([0-9a-f]{40})/)?.[1]; if (!pin) throw new Error("Reef's page names no node commit");
+  const base = `https://cdn.jsdelivr.net/gh/bitcoin-blake/blaketestnode@${pin}`;
+  const { workerSource } = await import(`${base}/browser/tabnode.js`);
+  if (!workerSource) throw new Error(`the node the apps pin (${pin.slice(0, 7)}) predates checked loading`);
+  worker = new Worker(URL.createObjectURL(new Blob([await workerSource(base)], { type: 'text/javascript' })), { type: 'module' });
+  document.querySelector('.sub').textContent += ` · node ${pin.slice(0, 7)}, as the apps of this site run it`;
+} catch (e) {
+  for (const b of document.querySelectorAll('button')) b.disabled = true;
+  document.querySelector('.sub').textContent = `this page runs only the node the apps of this site pin, and could not load it: ${e.message}`;
+  document.querySelector('.sub').className = 'sub warn';
+  throw e;
+}
 worker.onmessage = (e) => {
   const m = e.data;
   if (m.type === 'log') log(m.text);

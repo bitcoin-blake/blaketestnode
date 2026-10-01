@@ -5,8 +5,8 @@ import { Sha256 } from '../lib/sha256.mjs';
 import { buildIndexAsync, indexBytes, parseIndexBytes } from '../lib/packed.mjs';
 import { bytesToHex } from '../lib/bytes.mjs';
 import { PackedUtxo } from '../lib/packed.mjs';
-import { ChainNode } from '../lib/node.mjs';
-import { fetchTip, subscribeTip, judgeTip as judge, servedDisagreement, rollbackAllowed } from '../lib/nip333.mjs';
+import { ChainNode, checkContextHeaders } from '../lib/node.mjs';
+import { fetchTip, subscribeTip, judgeTip as judge, servedDisagreement, rollbackAllowed, higherTip } from '../lib/nip333.mjs';
 import { buildTemplate, checkTemplate } from '../lib/template.mjs';
 import { makeWebMiner } from '../lib/webminer.mjs';
 const SIDESTR = 'https://cdn.jsdelivr.net/gh/sidestr/spec@cec654b7d06907130700fe52c66c3f9d0921495d/siding/lib';
@@ -26,6 +26,7 @@ const RULES_SHA256 = {
 // the layout of the node's files in this origin's storage: a newer node that changes a format raises it, and an older node
 // refuses files of a newer layout rather than misread them
 const LAYOUT = 1;
+const MIGRATIONS = {}; // layout n → async () => carries files of layout n to n+1; none yet
 let engine = null;
 async function loadEngine() {
   if (engine) return engine;
@@ -229,7 +230,7 @@ async function withSnapshot(fn) {
 function judgeTip() {
   const t = chain.tipHeaders; if (!t || !chain.node) return;
   const { agree, diverged } = judge(t, { applied: (h) => chain.node.chain[h], served: (h) => chain.source?.byHeight?.get(h)?.hash });
-  const prev = chain.nostr; const next = { height: t.height, hash: t.hash, relay: t.relay, created_at: t.created_at, live: !!t.live, agree, diverged, aboveTip: chain.node.height - t.height };
+  const prev = chain.nostr; const next = { height: t.height, hash: t.hash, relay: t.relay, created_at: t.created_at, live: !!t.live, agree, diverged, aboveTip: chain.node.height - t.height, kept: t.relay === 'this tab (kept)' };
   if (!prev || prev.agree !== agree || prev.diverged !== diverged || prev.height !== next.height || prev.hash !== next.hash || prev.live !== next.live) { chain.nostr = next; post({ type: 'nostr', ...next }); }
 }
 // the served chain against the last signed headers this tab holds, before any rollback or apply: a block file that differs
@@ -241,6 +242,14 @@ async function servedAgainstTip() {
     throw new Error(`block file disagrees with the NIP-333 headers at ${h}: nothing is applied or rolled back until they agree`); }
 }
 const tipFrom = (t, k, live) => ({ height: t.height, hash: t.hash, relay: t.relay, created_at: t.created_at, live, first: t.first, hashes: (t.headers ?? []).map((x) => k.codec.blockHash(x)) });
+// the signed tip this tab holds the chain to: never lowered by an older event or by none at all, and kept between sessions
+// (tip.json), so a relay that hands an old genuine tip cannot lower the floor the served chain and rollbacks are held to
+async function setTip(t) {
+  const prev = chain.tipHeaders; if (!t || higherTip(prev, t) !== t) return; /* lower than the floor: kept as it is */
+  chain.tipHeaders = t;
+  if (!prev || t.height > prev.height || t.hash !== prev.hash) { try { await writeSmall('tip.json', JSON.stringify({ height: chain.tipHeaders.height, hash: chain.tipHeaders.hash, first: chain.tipHeaders.first, hashes: chain.tipHeaders.hashes, created_at: chain.tipHeaders.created_at })); } catch {} }
+}
+async function loadTip() { if (chain.tipHeaders) return; try { const j = JSON.parse((await readSmall('tip.json')) ?? 'null'); if (j?.hashes?.length && j.first + j.hashes.length - 1 === j.height) chain.tipHeaders = { ...j, live: false, relay: 'this tab (kept)' }; } catch {} }
 async function sync(blocksUrl, { noScripts = false } = {}) {
   if (chain.syncing) return; chain.syncing = true; chain.syncAbort = new AbortController();
   const t0 = performance.now();
@@ -250,6 +259,7 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     const utxo = await loadSet();
     chain.blocksUrl = blocksUrl;
     chain.source ??= new OpfsBlockSource(k, blocksUrl, files, { log, signal: () => chain.syncAbort?.signal ?? null });
+    await loadTip();
     const u = await chain.source.update();
     post({ type: 'blockfile', ...u });
     await servedAgainstTip();
@@ -257,8 +267,9 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     if (!chain.node) {
       const ctx = await chain.source.contextHeaders(blocksUrl.replace(/-blocks$/, '-context-headers.json'), { from: epochStart, to: SNAPSHOT.baseHeight });
       if (ctx.from !== epochStart || ctx.to !== SNAPSHOT.baseHeight) throw new Error('context headers cover the wrong range');
+      const ctxHeaders = checkContextHeaders(k, ctx, SNAPSHOT.baseHash);
       chain.node = new ChainNode({ k, utxo, epochStart, log });
-      chain.node.loadContext(ctx.headers.map((h) => k.codec.decode('BlockHeader', h)));
+      chain.node.loadContext(ctxHeaders);
       chain.node.setBase(SNAPSHOT.baseHeight, SNAPSHOT.baseHash);
       // our own record of blocks applied in earlier sessions, replayed if it still follows the served chain
       try { chain.deltas = JSON.parse((await readSmall('deltas.json')) ?? '[]'); if (!Array.isArray(chain.deltas)) throw new Error('not a list'); } catch (e) { chain.deltas = []; log(`the delta log could not be read (${e.message}): the blocks since the snapshot are validated again`); }
@@ -274,9 +285,10 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     const nip = !chain.tipAt || Date.now() - chain.tipAt > 600_000 ? await fetchTip(k, CHAIN.nip333, { nostr }) : null;
     if (!chain.tipAt || Date.now() - chain.tipAt > 600_000) chain.tipAt = Date.now();
     if (nip) {
-      chain.tipHeaders = tipFrom(nip, k, false);
+      const fresh = tipFrom(nip, k, false);
       for (let i = 0; i < nip.headers.length; i++) { const h = nip.first + i; const have = await chain.source.hash(h);
-        if (have && have !== chain.tipHeaders.hashes[i]) { chain.nostr = { height: nip.height, hash: nip.hash, relay: nip.relay, created_at: nip.created_at, agree: 0, diverged: true }; post({ type: 'nostr', ...chain.nostr }); throw new Error(`block file disagrees with the NIP-333 headers at ${h}`); } }
+        if (have && have !== fresh.hashes[i]) { chain.nostr = { height: nip.height, hash: nip.hash, relay: nip.relay, created_at: nip.created_at, agree: 0, diverged: true }; post({ type: 'nostr', ...chain.nostr }); throw new Error(`block file disagrees with the NIP-333 headers at ${h}`); } }
+      await setTip(fresh);
       judgeTip();
     }
     // rollback if the served chain diverged from what we applied
@@ -302,7 +314,7 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     if (!chain.timer) {
       chain.timer = setInterval(() => queueSync(), 30_000);
       chain.noScripts = noScripts;
-      chain.tipSub = await subscribeTip(k, CHAIN.nip333, (t) => { chain.tipAt = Date.now(); if (chain.tipHeaders && t.height < chain.tipHeaders.height) return; /* an older event replayed by a relay says nothing new */ chain.tipHeaders = tipFrom(t, k, true); judgeTip(); if (t.height > chain.node.height) setTimeout(() => queueSync(), 3000); }, { nostr, log });
+      chain.tipSub = await subscribeTip(k, CHAIN.nip333, async (t) => { chain.tipAt = Date.now(); if (chain.tipHeaders && t.height < chain.tipHeaders.height) return; /* an older event replayed by a relay says nothing new */ await setTip(tipFrom(t, k, true)); judgeTip(); if (t.height > chain.node.height) setTimeout(() => queueSync(), 3000); }, { nostr, log });
     }
   } finally { chain.syncing = false; chain.syncAbort = null; }
 }
@@ -310,7 +322,7 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
 let mpTimer = null; const watch = { scripts: new Set(), outpoints: new Set() }; // a wallet's scripts and coins: their transactions are always sent, past the first 1,000
 function postMempool(now = false) { if (!chain.mempool) return; if (mpTimer && !now) return; if (mpTimer) clearTimeout(mpTimer);
   mpTimer = setTimeout(() => { mpTimer = null; const mp = chain.mempool; const list = mp.list(); const keyOf = (p) => `${p.txid}:${p.vout}`;
-    post({ type: 'mempool', height: chain.node?.height ?? null, count: list.length, bytes: list.reduce((a, e) => a + e.vsize, 0), fees: list.reduce((a, e) => a + e.fee, 0), stats: mp.stats, txs: list.filter((e, i) => i < 1000 || e.tx.outputs.some((o) => watch.scripts.has(o.scriptPubKey)) || e.tx.inputs.some((x) => watch.outpoints.has(keyOf(x.prevout)))).map((e) => ({ txid: e.txid, fee: e.fee, vsize: e.vsize, feeRate: e.feeRate, at: e.at, inputs: e.tx.inputs.map((i) => keyOf(i.prevout)), outputs: e.tx.outputs.map((o) => ({ value: o.value, scriptPubKey: o.scriptPubKey })), via: e.via ?? '', fed: !!e.fed })), lastFeedAt: mp.lastFeedAt ?? null, following: !!chain.mempoolSub }); }, now ? 0 : 200); }
+    post({ type: 'mempool', height: chain.node?.height ?? null, count: list.length, bytes: list.reduce((a, e) => a + e.vsize, 0), fees: list.reduce((a, e) => a + e.fee, 0), stats: mp.stats, /* every transaction, compactly: [txid, vsize, fee, at, fed], so a page's figures cover the whole pool, not the first 1,000 */ all: list.map((e) => [e.txid, e.vsize, e.fee, e.at, e.fed ? 1 : 0]), txs: list.filter((e, i) => i < 1000 || e.tx.outputs.some((o) => watch.scripts.has(o.scriptPubKey)) || e.tx.inputs.some((x) => watch.outpoints.has(keyOf(x.prevout)))).map((e) => ({ txid: e.txid, fee: e.fee, vsize: e.vsize, feeRate: e.feeRate, at: e.at, inputs: e.tx.inputs.map((i) => keyOf(i.prevout)), outputs: e.tx.outputs.map((o) => ({ value: o.value, scriptPubKey: o.scriptPubKey })), via: e.via ?? '', fed: !!e.fed })), lastFeedAt: mp.lastFeedAt ?? null, feedFileAt: mp.feedFileAt ?? null, following: !!chain.mempoolSub }); }, now ? 0 : 200); }
 async function coin(key) {
   const { k } = await loadEngine(); const utxo = await loadSet();
   const c = utxo.get(key);
@@ -334,13 +346,15 @@ const quiet = (text) => Object.assign(new Error(text), { quiet: true });
 self.onmessage = (e) => { const m = e.data;
   if (m.type === 'ping') return post({ type: 'pong', t: m.t ?? null }); /* answered at once, outside the queue: the page's proof that the node is alive */
   if (m.type === 'wake') { chain.tipSub?.reopen(); chain.mempoolSub?.reopen(); if (chain.syncing) chain.syncAbort?.abort(quiet('the page woke: a fresh sync replaces the one in flight')); }
-  else if (m.type === 'wipe') { if (chain.timer) { clearInterval(chain.timer); chain.timer = null; } chain.syncAbort?.abort(quiet('wiping')); chain.fetchAbort.abort(quiet('wiping')); chain.cpuAbort = quiet('wiping'); try { chain.tipSub?.close(); chain.mempoolSub?.close(); chain.miner?.close?.(); } catch {} chain.tipSub = chain.mempoolSub = chain.miner = null; }
+  else if (m.type === 'wipe') { if (chain.timer) { clearInterval(chain.timer); chain.timer = null; } clearInterval(chain.feedTimer); chain.tipHeaders = null; chain.syncAbort?.abort(quiet('wiping')); chain.fetchAbort.abort(quiet('wiping')); chain.cpuAbort = quiet('wiping'); try { chain.tipSub?.close(); chain.mempoolSub?.close(); chain.miner?.close?.(); } catch {} chain.tipSub = chain.mempoolSub = chain.miner = null; }
   enqueue(() => handle(m)); };
 // the files' layout, read once: absent is written as this node's; newer stops everything but a wipe
 let layoutChecked = false;
 async function checkLayout() {
   if (layoutChecked) return; let j = null; try { j = JSON.parse((await readSmall('layout.json')) ?? 'null'); } catch {}
   if (j && Number(j.layout) > LAYOUT) throw new Error(`this site's node files were written by a newer node (layout ${j.layout}, this one reads ${LAYOUT}): reload the page to get the newer node, or wipe the snapshot`);
+  /* an older layout is read only through a migration written for it; with none, it is refused rather than misread */
+  if (j && Number(j.layout) < LAYOUT) { const mig = MIGRATIONS[Number(j.layout)]; if (!mig) throw new Error(`this site's node files were written by an older node (layout ${j.layout}, this one reads ${LAYOUT}) and cannot be carried over: wipe the snapshot`); await mig(); }
   if (!j || Number(j.layout) !== LAYOUT) await writeSmall('layout.json', JSON.stringify({ layout: LAYOUT }));
   layoutChecked = true;
 }
@@ -386,10 +400,17 @@ async function handle(m) {
       const mp = new Mempool({ k, node: chain.node, network: CHAIN.network, log, onChange: () => postMempool(), onRefuse: (r, tx) => { if (tx && (tx.inputs.some((i) => watch.outpoints.has(`${i.prevout.txid}:${i.prevout.vout}`)) || tx.outputs.some((o) => watch.scripts.has(o.scriptPubKey)))) post({ type: 'refused', txid: r.txid, error: r.error, hex: r.hex }); /* the exact bytes: a copy with a broken signature has the same txid */ } }); chain.mempool = mp;
       // a check reads the UTXO set, which needs the snapshot attached: adds from the relays are queued as jobs like everything else
       const rawAdd = mp.add.bind(mp); mp.add = (hex, from, via) => { if (via === 'feed') mp.lastFeedAt = Date.now(); enqueue(() => withSnapshot(() => { rawAdd(hex, from, via); })); return { ok: true, queued: true }; };
-      chain.mempoolSub = await subscribeMempool(mp, { relays: m.relays, network: CHAIN.network, nostr, also: m.also ?? [], log });
+      chain.mempoolSub = await subscribeMempool(mp, { relays: m.relays, network: CHAIN.network, nostr, also: m.also ?? [], log, feedPublishers: CHAIN.mempoolFeed?.publishers ?? null });
       if (m.seedUrl) { try { const { res: r, bytes } = await fetchIdle(m.seedUrl, { cache: 'no-store' }); if (r.ok) { const j = JSON.parse(new TextDecoder().decode(bytes)); let n = 0; await withSnapshot(() => { for (const t of j.txs ?? []) { if (rawAdd(t.hex, 'the mirror', 'seed').ok) n++; } }); log(`mempool: ${n} of ${(j.txs ?? []).length} from the mirror's file at height ${j.height}`); } } catch (e) { log(`mempool: seed file: ${e.message}`); } }
+      // the broadcaster's heartbeat: the mirror's mempool file is rewritten by the estate's node on every pass (its `time`), whether
+      // or not a transaction arrived; read every two minutes, so a page can tell a quiet chain from a stopped broadcaster
+      clearInterval(chain.feedTimer); const beat = async () => { try { const { res, bytes } = await fetchIdle(m.seedUrl, { cache: 'no-store' }, { totalMs: 30_000 }); if (res.ok) { const j = JSON.parse(new TextDecoder().decode(bytes)); if (Number.isFinite(j.time)) { mp.feedFileAt = j.time * 1000; postMempool(); } } } catch {} };
+      if (m.seedUrl) { beat(); chain.feedTimer = setInterval(beat, 120_000); }
       postMempool(true); }
     else if (m.type === 'mempool-list') postMempool(true);
+    else if (m.type === 'mempool-get') { // one transaction of the pool, whole: a page's search past the first 1,000
+      const e = chain.mempool?.txs.get(String(m.txid).toLowerCase()); const keyOf = (p) => `${p.txid}:${p.vout}`;
+      post({ type: 'mempool-tx', txid: String(m.txid).toLowerCase(), found: !!e, ...(e ? { fee: e.fee, vsize: e.vsize, feeRate: e.feeRate, at: e.at, via: e.via ?? '', fed: !!e.fed, inputs: e.tx.inputs.map((i) => keyOf(i.prevout)), outputs: e.tx.outputs.map((o) => ({ value: o.value, scriptPubKey: o.scriptPubKey })) } : {}), req: m.req ?? null }); }
     else if (m.type === 'mine') await withSnapshot(() => startMining(m));
     else if (m.type === 'found') await withSnapshot(async () => foundNonce(m));
     else if (m.type === 'mine-solo') await withSnapshot(() => startSolo(m));
