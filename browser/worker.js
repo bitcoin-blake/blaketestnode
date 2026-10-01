@@ -6,7 +6,7 @@ import { buildIndexAsync, indexBytes, parseIndexBytes } from '../lib/packed.mjs'
 import { bytesToHex } from '../lib/bytes.mjs';
 import { PackedUtxo } from '../lib/packed.mjs';
 import { ChainNode, checkContextHeaders } from '../lib/node.mjs';
-import { fetchTip, subscribeTip, judgeTip as judge, rollbackAllowed, nextVouched, vouchedUnder, keptTip, sourceVouched, realNowOf, takesTip, sameWord, liveTipStep, settleOrRefuse } from '../lib/nip333.mjs';
+import { fetchTip, subscribeTip, judgeTip as judge, rollbackAllowed, nextVouched, keptTip, sourceVouched, realNowFor, setTipOn, liveTipOn, applyPlan, settleOrRefuse } from '../lib/nip333.mjs';
 import { buildTemplate, checkTemplate } from '../lib/template.mjs';
 import { makeWebMiner } from '../lib/webminer.mjs';
 const SIDESTR = 'https://cdn.jsdelivr.net/gh/sidestr/spec@cec654b7d06907130700fe52c66c3f9d0921495d/siding/lib';
@@ -169,8 +169,8 @@ async function wipe() {
   try { for await (const [name] of d.entries()) names.push(name); } catch { names = [SNAPSHOT.file, `${SNAPSHOT.file}.idx`, `${SNAPSHOT.file}.sha256`, `${SNAPSHOT.file}.ranges`, `${SNAPSHOT.file}.part`, 'blocks.dat', 'blocks.json', 'deltas.json', 'tip.json', 'context-headers.json', `context-headers-${SNAPSHOT.baseHeight}.json`]; }
   const removed = [], failed = [];
   for (const n of names) { try { await d.removeEntry(n, { recursive: true }); removed.push(n); } catch (e) { if (e?.name !== 'NotFoundError') failed.push(`${n}: ${e.message}`); } }
-  layoutChecked = false;
-  Object.assign(chain, { node: null, utxo: null, source: null, bytes: null, deltas: [], cpuAbort: null });
+  layoutChecked = false; clearInterval(chain.timer); clearTimeout(chain.retryTimer);
+  Object.assign(chain, { node: null, utxo: null, source: null, bytes: null, deltas: [], cpuAbort: null, timer: null, retryTimer: null, blocksUrl: null, tipAt: null, forcedAt: null, refusedN: 0 });
   post({ type: 'wiped', removed, failed });
 }
 
@@ -241,18 +241,12 @@ function refuseServed(t, h) {
   throw new Error(`block file disagrees with the NIP-333 headers at ${h}: nothing is applied or rolled back until they agree`);
 }
 // the real time as this tab best knows it: its clock less the skew the page measured (seconds, + when this clock is fast)
-const realNow = () => realNowOf(Date.now(), chain.skewS);
+const realNow = () => realNowFor(chain);
 const tipFrom = (t, k, live) => ({ height: t.height, hash: t.hash, relay: t.relay, created_at: t.created_at, live, first: t.first, hashes: (t.headers ?? []).map((x) => k.codec.blockHash(x)) });
 // the signed tip this tab holds the chain to: never lowered by an older event or by none at all, and kept between sessions
 // (tip.json), so a relay that hands an old genuine tip cannot lower the floor the served chain and rollbacks are held to
 // → true when the tip was taken and is a new word (the same tip said again by a relay is taken, but is not news)
-async function setTip(t) {
-  const prev = chain.tipHeaders; if (!takesTip(prev, t, realNow())) return false; /* an older word than the one held: kept as it is */
-  chain.tipHeaders = t; const news = !sameWord(prev, t);
-  const v = vouchedUnder(chain.vouchedTo, t); if (v !== (chain.vouchedTo ?? null)) { chain.vouchedTo = v; await saveTip(); return news; } /* not vouched above what the publisher now signs */
-  if (!prev || t.height !== prev.height || t.hash !== prev.hash) await saveTip();
-  return news;
-}
+const setTip = (t) => setTipOn(chain, t, { save: saveTip });
 // tip.json: the signed headers this tab holds the chain to, and how far its applied chain has been vouched for by them
 const saveTip = async () => { const t = chain.tipHeaders; if (!t) return; try { await writeSmall('tip.json', JSON.stringify({ height: t.height, hash: t.hash, first: t.first, hashes: t.hashes, created_at: t.created_at, vouchedTo: chain.vouchedTo ?? null, source: chain.blocksUrl ?? null })); } catch {} };
 function setVouched(v) { if (v === (chain.vouchedTo ?? null)) return; chain.vouchedTo = v; saveTip(); }
@@ -271,19 +265,17 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     post({ type: 'blockfile', ...u });
     // the live signed tip, heard from the first sync on, before anything here can stop it: a sync refused by a kept tip the chain
     // has moved past still hears the publisher's next word
-    chain.tipSub ??= await subscribeTip(k, CHAIN.nip333, async (t) => { /* an older event replayed by a relay is refused by setTip (older created_at), and moves nothing */ const step = liveTipStep({ taken: await setTip(tipFrom(t, k, true)), nodeHeight: chain.node?.height ?? null, height: t.height, now: Date.now() }); if (step.tipAt != null) chain.tipAt = step.tipAt; judgeTip(); if (step.sync) setTimeout(() => queueSync(), 3000); }, { nostr, log, skewS: () => chain.skewS ?? 0 });
+    if (!chain.tipSub && !chain.wiped) { /* an older event replayed by a relay is refused by setTip (older created_at), and moves nothing */
+      const sub = await subscribeTip(k, CHAIN.nip333, (t) => liveTipOn(chain, tipFrom(t, k, true), { take: setTip, judge: judgeTip, later: () => setTimeout(() => queueSync(), 3000) }), { nostr, log, skewS: () => chain.skewS ?? 0 });
+      if (chain.wiped) sub.close(); else chain.tipSub = sub; }
     // the relays' word on the tip: fetched on the first sync, then only when the live subscription has said nothing for ten
     // minutes (a fetch opens a socket per relay; every 30 s that is thousands a day), or at most once a minute when the tip held
     // disagrees with the served chain. The later word of the held and the fetched tip is held against the served chain, before
     // any rollback or apply
     const plan = await settleOrRefuse({ held: chain.tipHeaders, tipAt: chain.tipAt, forcedAt: chain.forcedAt, now: Date.now(), nowMs: realNow(), refusedN: chain.refusedN ?? 0,
       served: (x) => chain.source.hash(x), fetch: async () => { const nip = await fetchTip(k, CHAIN.nip333, { nostr, held: chain.tipHeaders, nowMs: realNow }); return nip ? tipFrom(nip, k, false) : null; } });
-    chain.tipAt = plan.tipAt; chain.forcedAt = plan.forcedAt;
-    if (plan.setTip) await setTip(plan.setTip);
-    if (plan.refuseAt != null) { /* refused: asked again on its own (a minute, doubling to ten), the timer of a node that never synced not yet running */
-      chain.refusedN = (chain.refusedN ?? 0) + 1; clearTimeout(chain.retryTimer); chain.retryTimer = setTimeout(() => { chain.retryTimer = null; queueSync(); }, plan.retryMs);
-      refuseServed(plan.refuseTip, plan.refuseAt); }
-    chain.refusedN = 0;
+    /* refused: asked again on its own (a minute, doubling to ten), the timer of a node that never synced not yet running */
+    await applyPlan(chain, plan, { take: setTip, retry: (ms) => { clearTimeout(chain.retryTimer); chain.retryTimer = setTimeout(() => { chain.retryTimer = null; queueSync(); }, ms); }, refuse: refuseServed });
     const epochStart = Math.floor(SNAPSHOT.baseHeight / CHAIN.retargetInterval) * CHAIN.retargetInterval;
     if (!chain.node) {
       const ctx = await chain.source.contextHeaders(blocksUrl.replace(/-blocks$/, '-context-headers.json'), { from: epochStart, to: SNAPSHOT.baseHeight });
@@ -325,7 +317,7 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     judgeTip();
     if (applied && chain.miner) { if (chain.solo) soloWork(`tip ${chain.node.height}`); else newWork(`tip ${chain.node.height}`); }
     post({ type: 'synced', aboveTip: chain.tipHeaders ? chain.node.height - chain.tipHeaders.height : null, height: chain.node.height, hash: chain.node.tipHash(), time: chain.node.headers[chain.node.height]?.time ?? null, coins: utxo.size, applied, txs, ms: performance.now() - t0, stats: chain.node.stats, scripts: !noScripts, quiet: applied === 0 && !!chain.timer });
-    if (!chain.timer) {
+    if (!chain.timer && !chain.wiped) {
       chain.timer = setInterval(() => queueSync(), 30_000);
       chain.noScripts = noScripts;
     }
@@ -346,13 +338,13 @@ async function coin(key) {
 
 // a sync from the timer or a tip is queued only when none is queued or running already: on a slow link they would pile up
 // and keep the wallet's lookups waiting behind them
-function queueSync() { if (chain.syncing || chain.syncQueued || !chain.blocksUrl) return; chain.syncQueued = true; enqueue(() => { chain.syncQueued = false; return withSnapshot(() => sync(chain.blocksUrl, { noScripts: !!chain.noScripts })); }); }
+function queueSync() { if (chain.syncing || chain.syncQueued || !chain.blocksUrl || chain.wiped) return; chain.syncQueued = true; enqueue(() => { chain.syncQueued = false; return withSnapshot(() => sync(chain.blocksUrl, { noScripts: !!chain.noScripts })); }); }
 // a lookup reads only blocks this node applied (the served file can be ahead of, or on another branch than, what was validated)
 const applied = (h) => { const e = chain.source?.byHeight?.get(h); return e && chain.node && e.hash === chain.node.chain[h] ? e : null; };
 // one job at a time: every job opens OPFS handles, and two jobs interleaving at an await
 // would try to open the same file twice
 let queue = Promise.resolve();
-const enqueue = (fn) => (queue = queue.then(fn).catch((err) => (err?.quiet ? log(err.message) : post({ type: 'error', text: err.message }))));
+const enqueue = (fn) => (queue = queue.then(fn).catch((err) => (err?.quiet ? log(err.message) : post({ type: 'error', name: err?.name ?? null, text: err.message }))));
 // wake and wipe do not wait behind a job stuck on a dead connection: a wake aborts the sync in flight (a fresh one follows), a
 // wipe stops the timer, the fetches and the subscriptions first. Errors of an abort asked for here are not the node's errors.
 const quiet = (text) => Object.assign(new Error(text), { quiet: true });
@@ -360,7 +352,7 @@ self.onmessage = (e) => { const m = e.data;
   if (m.type === 'ping') return post({ type: 'pong', t: m.t ?? null }); /* answered at once, outside the queue: the page's proof that the node is alive */
   if (m.type === 'skew') { chain.skewS = Number.isFinite(Number(m.s)) ? Number(m.s) : 0; return; } /* the page's measure of this clock against the real one, in seconds: the live tip's look-back */
   if (m.type === 'wake') { chain.tipSub?.reopen(); chain.mempoolSub?.reopen(); chain.beat?.(); if (chain.syncing) chain.syncAbort?.abort(quiet('the page woke: a fresh sync replaces the one in flight')); }
-  else if (m.type === 'wipe') { if (chain.timer) { clearInterval(chain.timer); chain.timer = null; } clearTimeout(chain.retryTimer); chain.retryTimer = null; chain.refusedN = 0; clearInterval(chain.feedTimer); chain.tipHeaders = null; chain.vouchedTo = null; chain.beat = null; chain.syncAbort?.abort(quiet('wiping')); chain.fetchAbort.abort(quiet('wiping')); chain.cpuAbort = quiet('wiping'); try { chain.tipSub?.close(); chain.mempoolSub?.close(); chain.miner?.close?.(); } catch {} chain.tipSub = chain.mempoolSub = chain.miner = null; }
+  else if (m.type === 'wipe') { chain.wiped = true; /* nothing started from here on re-arms a timer or a sync, until the page asks for a sync again */ if (chain.timer) { clearInterval(chain.timer); chain.timer = null; } clearTimeout(chain.retryTimer); chain.retryTimer = null; chain.refusedN = 0; clearInterval(chain.feedTimer); chain.tipHeaders = null; chain.vouchedTo = null; chain.beat = null; chain.syncAbort?.abort(quiet('wiping')); chain.fetchAbort.abort(quiet('wiping')); chain.cpuAbort = quiet('wiping'); try { chain.tipSub?.close(); chain.mempoolSub?.close(); chain.miner?.close?.(); } catch {} chain.tipSub = chain.mempoolSub = chain.miner = null; }
   enqueue(() => handle(m)); };
 let reseeding = false;
 // the files' layout, read once: absent is written as this node's; newer stops everything but a wipe
@@ -376,7 +368,7 @@ async function checkLayout() {
 async function handle(m) {
   try {
     if (m.type !== 'wipe' && m.type !== 'close') await checkLayout();
-    if (m.type === 'sync') await withSnapshot(() => sync(m.blocksUrl, { noScripts: !!m.noScripts }));
+    if (m.type === 'sync') { chain.wiped = false; /* the page asks again: a wiped node starts over */ await withSnapshot(() => sync(m.blocksUrl, { noScripts: !!m.noScripts })); }
     else if (m.type === 'wake') { /* the page was asleep or offline: sockets were reopened on arrival; look for blocks */ if (chain.node && chain.blocksUrl) await withSnapshot(() => sync(chain.blocksUrl, { noScripts: !!chain.noScripts })); }
     else if (m.type === 'close') { if (chain.timer) { clearInterval(chain.timer); chain.timer = null; } }
     else if (m.type === 'debug') await withSnapshot(async () => {
@@ -455,5 +447,5 @@ async function handle(m) {
     else if (m.type === 'hash') { const hex = await hashFile(); post({ type: 'fetched', bytes: await sizeOf(SNAPSHOT.file), ms: 0, sha256: hex, ok: hex === SNAPSHOT.sha256 }); await status(); }
     else if (m.type === 'verify') { await verify(); await status(); }
     else if (m.type === 'wipe') { await wipe(); await status(); }
-  } catch (err) { if (err?.quiet) return log(err.message); post({ type: 'error', text: err.message + (err.stack ? ' @ ' + err.stack.split('\n').slice(1, 4).map((l) => l.trim()).join(' < ') : ''), ...(m.req != null ? { req: m.req } : {}) }); } /* an answer to a request names it */
+  } catch (err) { if (err?.quiet) return log(err.message); post({ type: 'error', name: err?.name ?? null, text: err.message + (err.stack ? ' @ ' + err.stack.split('\n').slice(1, 4).map((l) => l.trim()).join(' < ') : ''), ...(m.req != null ? { req: m.req } : {}) }); } /* an answer to a request names it */
 }

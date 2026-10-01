@@ -39,7 +39,7 @@ let ok = 0, bad = 0; const t = (name, cond, detail = '') => { console.log(`  ${c
 { // the worker's wiring, read as text (it runs only in a browser)
   const w = readFileSync(new URL('../browser/worker.js', import.meta.url), 'utf8'), l = readFileSync(new URL('../browser/tabnode.js', import.meta.url), 'utf8');
   t('the worker reads a changed file again and marks it fed', /if \(e !== etag\) await read\(true\)/.test(w) && /mp\.markFed\(/.test(w));
-  t('setTip caps the vouched height; tip.json keeps the block source and refuses a future-dated tip', /vouchedUnder\(chain\.vouchedTo, t\)/.test(w) && /source: chain\.blocksUrl/.test(w) && /keptTip\(JSON\.parse/.test(w));
+  t('setTip caps the vouched height; tip.json keeps the block source and refuses a future-dated tip', /const setTip = \(t\) => setTipOn\(chain, t, \{ save: saveTip \}\)/.test(w) && /source: chain\.blocksUrl/.test(w) && /keptTip\(JSON\.parse/.test(w));
   t('a delta log that breaks off caps the vouched height at what was replayed', /chain\.vouchedTo > chain\.node\.height\) setVouched\(chain\.node\.height\)/.test(w));
   t('block replies carry the coinbase value', /coinbaseValue,/.test(w));
   t('the loader\'s wipe stops its retry and marks the node wiped; a wake ignores it', /wipe\(\{ timeoutMs = 20_000 \} = \{\}\) \{ swarmTeardown\(true\); clearTimeout\(retryTimer\)/.test(l) && /node\.phase === 'wiped'\) return/.test(l));

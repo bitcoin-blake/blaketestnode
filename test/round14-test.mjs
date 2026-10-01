@@ -86,8 +86,10 @@ const never = async () => { throw new Error('not asked'); };
 { // text checks for what runs only in a browser
   const w = readFileSync(new URL('../browser/worker.js', import.meta.url), 'utf8'), l = readFileSync(new URL('../browser/tabnode.js', import.meta.url), 'utf8');
   const sync = w.slice(w.indexOf('async function sync('), w.indexOf('// rollback if the served chain diverged'));
-  t('the worker takes the plan as given: tipAt, forcedAt, the tip, and a refusal with its retry before it stops', /chain\.tipAt = plan\.tipAt; chain\.forcedAt = plan\.forcedAt;/.test(sync) && /if \(plan\.setTip\) await setTip\(plan\.setTip\)/.test(sync) && sync.indexOf('chain.retryTimer = setTimeout') < sync.indexOf('refuseServed(plan.refuseTip, plan.refuseAt)'));
-  t('...the live callback goes through liveTipStep with what setTip returned; a wipe clears the retry', /liveTipStep\(\{ taken: await setTip\(/.test(sync) && /return news;/.test(w) && /m\.type === 'wipe'\) \{[^\n]*clearTimeout\(chain\.retryTimer\)/.test(w));
-  t('a request\'s error names the request; the loader does not take it for the node\'s state', /\.\.\.\(m\.req != null \? \{ req: m\.req \} : \{\}\)/.test(w) && /node\.synced && \(m\.req != null \|\|/.test(l));
+  const at = (re) => { const m = re.exec(sync); return m ? m.index : -1; };
+  const plan = at(/await applyPlan\(chain, plan, \{ take: setTip, retry: \(ms\) => \{ clearTimeout\(chain\.retryTimer\); chain\.retryTimer = setTimeout\(/), refuse = at(/refuse: refuseServed \}\);/), settle = at(/const plan = await settleOrRefuse\(/);
+  t('the worker applies the plan through applyPlan (the times, the tip, a refusal with its retry), right after settling it', settle >= 0 && plan >= 0 && refuse >= 0 && settle < plan && plan < refuse);
+  t('...the live callback goes through liveTipOn with setTip; a wipe clears the retry', /liveTipOn\(chain, tipFrom\(t, k, true\), \{ take: setTip, judge: judgeTip, later: /.test(sync) && /m\.type === 'wipe'\) \{[^\n]*clearTimeout\(chain\.retryTimer\)/.test(w));
+  t('a request\'s error names the request; the loader does not take it for the node\'s state unless the node\'s files failed', /\.\.\.\(m\.req != null \? \{ req: m\.req \} : \{\}\)/.test(w) && /node\.synced && !storageFault\(m\) && \(m\.req != null \|\|/.test(l));
 }
 console.log(`\n${ok} passed, ${bad} failed`); process.exit(bad ? 1 : 0);

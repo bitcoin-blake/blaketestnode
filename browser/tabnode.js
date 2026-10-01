@@ -47,10 +47,10 @@ const torrentFileUrl = (snapshotUrl) => snapshotUrl.replace(/\.dat$/, '') + '.to
 // INTEGRITY:BEGIN
 export const CODE_SHA256 = {
   'browser/blocks.js': 'd64c9d892a979502111c9ea1cf06ad7a588cd3b6e6d1e1dbb2d9f670de481573',
-  'browser/worker.js': 'd083d01275f03e937b1335ac703d012d86476d299866badb17fbbe810978dd4c',
+  'browser/worker.js': '9a28dcc74bf3b429274358316cbd1bce0f0c233fa8f8ef5f2f2245f394a02595',
   'lib/bytes.mjs': 'c03070261249baaab1475caa4bf34f40c81556bc5fff97817c69951a356439d3',
   'lib/mempool.mjs': 'cd6fb29f9ad4c30e2430516a1cf2c2b43883a611e15bc6084df57068565bad23',
-  'lib/nip333.mjs': '3f5bff6c201261a41322f51319d34d1c02e7b64ce3c68d59ca24af0983047e7a',
+  'lib/nip333.mjs': 'dc0f18820c9d8c2ec68746c4ca52cb4bf55518e732ca07e6ebcaf3f1e2faba56',
   'lib/node.mjs': '94713169c52c1443bc1def4cc0ede7647113b62da976bc8623b8018e5984e727',
   'lib/packed.mjs': 'bf79465a5bf4bfcbbec600d8f42b3ded81f1daf8a065ea95c4c08977460ceb3c',
   'lib/params.mjs': 'ff9abe2d6eca1b10460f4b74577ad56cfcc74fa2fa411903ee8cac9f18734058',
@@ -80,6 +80,9 @@ export async function workerSource(base, { entry = 'browser/worker.js', fetchTex
   };
   return load(entry, true);
 }
+// an error from the node's files (a file gone, a handle held elsewhere, storage refused): the node's state, even when a request
+// met it; a lookup that found nothing is only that request's answer
+export const storageFault = (m) => /^(NotFoundError|NoModificationAllowedError|InvalidStateError|NotReadableError|QuotaExceededError)$/.test(m?.name ?? '');
 export function createTabNode({ base, snapshotUrl, blocksUrl, torrent = false, seed = false, wtUrl = WT_URL, coins = 14200000 }) {
   const node = { phase: 'starting', st: null, height: null, hash: null, time: null, coins: null, txids: null, hs: null, hsOk: null, sha: null, hist: [], nostr: null, recv: 0, sent: 0, synced: false, fetchT0: 0, verifyT0: 0, syncT0: 0, lastSync: null, error: null, peers: null, mempool: null };
   const opts = { torrent, seed };
@@ -167,7 +170,7 @@ export function createTabNode({ base, snapshotUrl, blocksUrl, torrent = false, s
     else if (m.type === 'synced') { retryN = 0; node.retryAt = null; clearTimeout(retryTimer); retryTimer = null; if (node.error && !/mismatch|FAILED/i.test(node.error)) { node.lastError = { text: node.error, at: Date.now() }; node.error = null; } if (!node.synced) hist(`validate ${n(m.applied)} blocks to the tip`, m.ms); node.synced = true; node.phase = 'synced'; node.height = m.height; node.hash = m.hash; node.time = m.time; node.lastSync = Date.now(); sync(m.applied ? `Up to date · ${n(m.height)} · ${m.applied} block${m.applied === 1 ? '' : 's'} validated` : `Up to date · ${n(m.height)}`, null); }
     else if (m.type === 'nostr') { node.nostr = m; }
     else if (m.type === 'mempool') { node.mempool = m; }
-    else if (m.type === 'error') { const lookup = node.synced && (m.req != null || /Block not found|sync first|not in the set|not in mempool/.test(m.text)); /* a request's own answer, not the node's state */ if (!lookup) { node.error = m.text; sync('Error: ' + m.text.slice(0, 140), null); }
+    else if (m.type === 'error') { const lookup = node.synced && !storageFault(m) && (m.req != null || /Block not found|sync first|not in the set|not in mempool/.test(m.text)); /* a request's own answer, not the node's state; a fault in the node's files is the node's, whoever asked */ if (!lookup) { node.error = m.text; sync('Error: ' + m.text.slice(0, 140), null); }
       if (!lookup && node.phase === 'fetch' && !swarm && NETWORK.test(m.text) && !retryTimer) { const wait = Math.min(300_000, 5000 * 2 ** retryN++); log(`the snapshot's source did not answer: the fetch resumes in ${Math.round(wait / 1000)} s`); node.retryAt = Date.now() + wait; retryTimer = setTimeout(() => { retryTimer = null; node.retryAt = null; node.lastError = { text: node.error, at: Date.now() }; node.error = null; plainFetch(); }, wait); }
       if (!lookup && node.phase === 'sync' && !node.synced && NETWORK.test(m.text) && !retryTimer) { const wait = Math.min(300_000, 5000 * 2 ** retryN++); log(`the block source did not answer: trying again in ${Math.round(wait / 1000)} s`); node.retryAt = Date.now() + wait; retryTimer = setTimeout(retrySync, wait); } log((lookup ? '' : 'node error: ') + m.text.replace(/ @ .*$/, '') + (lookup ? ' (code -5)' : ''), 'err'); }
     else if (m.type === 'log') { log(m.text); }

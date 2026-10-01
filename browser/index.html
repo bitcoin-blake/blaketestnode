@@ -1,5 +1,5 @@
 <!doctype html>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'sha256-svVsmXbaU3I/Z/071BEJRqpYC4hDq3cgAFh7D+/q6Os=' blob: https://cdn.jsdelivr.net 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self' https: wss:; img-src 'self' data:; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>blaketestnode in the browser</title>
 <style>
   :root{--bg:#f6f7f9;--card:#fff;--line:#e3e6eb;--text:#1f2430;--muted:#6b7280;--ok:#15803d;--warn:#b45309;--bad:#b91c1c;--link:#1d4ed8;--okbg:#dcfce7}
@@ -133,10 +133,10 @@ $('pay').value = params.get('pay') ?? localStorage.getItem('payScript') ?? ''; $
 $('build').onclick = () => { const pay = $('pay').value.trim().toLowerCase(); if (!/^[0-9a-f]{4,80}$/.test(pay)) return log('give the pay script as hex (an address is next)'); localStorage.setItem('payScript', pay); worker.postMessage({ type: 'template', pay }); };
 $('mempool').onclick = () => { const relays = $('mprelays').value.split(',').map((x) => x.trim()).filter(Boolean); if (!relays.length) return log('give at least one relay'); localStorage.setItem('mempoolRelays', relays.join(',')); worker.postMessage({ type: 'mempool', relays }); };
 // hashing workers (the datstr miner's core from jsDelivr; WebAssembly when it loads): they grind the 80 bytes this tab built
-const CORE = 'https://cdn.jsdelivr.net/gh/datstr/spec@de20c5d2060a0d0d9d41d4fcc12f55e5b6ea08f1/gateway/miner-core.mjs', WASM = 'https://cdn.jsdelivr.net/gh/datstr/spec@de20c5d2060a0d0d9d41d4fcc12f55e5b6ea08f1/gateway/miner-mine.wasm', SCHEMA_CDN = 'https://cdn.jsdelivr.net/gh/bitcoin-desktop/schema@v0.0.27';
+const CORE = 'https://cdn.jsdelivr.net/gh/datstr/spec@de20c5d2060a0d0d9d41d4fcc12f55e5b6ea08f1/gateway/miner-core.mjs', WASM = 'https://cdn.jsdelivr.net/gh/datstr/spec@de20c5d2060a0d0d9d41d4fcc12f55e5b6ea08f1/gateway/miner-mine.wasm', SCHEMA_CDN = 'https://cdn.jsdelivr.net/gh/bitcoin-desktop/schema@b8cbf6337c7450fe14ddc5bce00c7280059aab5d';
 const hexOf = (a) => a.map((x) => x.toString(16).padStart(2, '0')).join('');
 let hashers = [], hashJob = null; const mstats = { found: 0, acked: 0, refused: 0, dropped: 0, hashes: 0, since: Date.now() }; const rate = () => Math.round(mstats.hashes / Math.max(1, (Date.now() - mstats.since) / 1000)).toLocaleString();
-const hasherSrc = `import { blake2b } from '${SCHEMA_CDN}/codec/pow/blake2b.js'; import { mine, hexToBytes, loadWasmMiner } from '${CORE}'; let current = null; const wasm = await loadWasmMiner('${WASM}'); self.postMessage({ type: 'engine', engine: wasm ? 'wasm' : 'js' }); const hasher = wasm ?? mine.bind(null, blake2b);
+const hasherSrc = `const [{ blake2b }, { mine, hexToBytes, loadWasmMiner }] = await Promise.all([import('${SCHEMA_CDN}/codec/pow/blake2b.js'), import('${CORE}')]); /* imported, not import statements: the page's policy refuses a blob worker's static imports */ let current = null; const wasm = await loadWasmMiner('${WASM}'); self.postMessage({ type: 'engine', engine: wasm ? 'wasm' : 'js' }); const hasher = wasm ?? mine.bind(null, blake2b);
 // the 32-bit nonce space is 2^32 hashes: a fast machine empties it in under a minute, and a piece of work at a real difficulty
 // rarely holds a valid nonce at all. So the second nonce word (bytes 36..39 of the work, header.nonce2) is rolled on every
 // wrap, as a rig rolls its extranonce, and reported with the nonce.
