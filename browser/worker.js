@@ -6,7 +6,7 @@ import { buildIndexAsync, indexBytes, parseIndexBytes } from '../lib/packed.mjs'
 import { bytesToHex } from '../lib/bytes.mjs';
 import { PackedUtxo } from '../lib/packed.mjs';
 import { ChainNode, checkContextHeaders } from '../lib/node.mjs';
-import { fetchTip, subscribeTip, judgeTip as judge, servedDisagreement, rollbackAllowed, higherTip } from '../lib/nip333.mjs';
+import { fetchTip, subscribeTip, judgeTip as judge, servedDisagreement, rollbackAllowed, higherTip, nextVouched } from '../lib/nip333.mjs';
 import { buildTemplate, checkTemplate } from '../lib/template.mjs';
 import { makeWebMiner } from '../lib/webminer.mjs';
 const SIDESTR = 'https://cdn.jsdelivr.net/gh/sidestr/spec@cec654b7d06907130700fe52c66c3f9d0921495d/siding/lib';
@@ -229,27 +229,31 @@ async function withSnapshot(fn) {
 // rollback and on every live event, so a mirror that serves another fork is caught once its block is applied or served
 function judgeTip() {
   const t = chain.tipHeaders; if (!t || !chain.node) return;
-  const { agree, diverged } = judge(t, { applied: (h) => chain.node.chain[h], served: (h) => chain.source?.byHeight?.get(h)?.hash });
-  const prev = chain.nostr; const next = { height: t.height, hash: t.hash, relay: t.relay, created_at: t.created_at, live: !!t.live, agree, diverged, aboveTip: chain.node.height - t.height, kept: t.relay === 'this tab (kept)' };
-  if (!prev || prev.agree !== agree || prev.diverged !== diverged || prev.height !== next.height || prev.hash !== next.hash || prev.live !== next.live) { chain.nostr = next; post({ type: 'nostr', ...next }); }
+  const j = judge(t, { applied: (h) => chain.node.chain[h], served: (h) => chain.source?.byHeight?.get(h)?.hash });
+  const { agree, diverged } = j; setVouched(nextVouched(chain.vouchedTo, j));
+  const prev = chain.nostr; const next = { height: t.height, hash: t.hash, relay: t.relay, created_at: t.created_at, live: !!t.live, agree, diverged, aboveTip: chain.node.height - t.height, kept: t.relay === 'this tab (kept)', vouchedTo: chain.vouchedTo ?? null };
+  if (!prev || prev.agree !== agree || prev.diverged !== diverged || prev.height !== next.height || prev.hash !== next.hash || prev.live !== next.live || prev.vouchedTo !== next.vouchedTo) { chain.nostr = next; post({ type: 'nostr', ...next }); }
 }
 // the served chain against the last signed headers this tab holds, before any rollback or apply: a block file that differs
 // from what the signed tip says is refused outright (neither rolled back to nor applied), not applied and flagged after
 async function servedAgainstTip() {
   const t = chain.tipHeaders; if (!t?.hashes?.length || !chain.source) return;
   const h = await servedDisagreement(t, (x) => chain.source.hash(x));
-  if (h != null) { chain.nostr = { height: t.height, hash: t.hash, relay: t.relay, created_at: t.created_at, live: !!t.live, agree: 0, diverged: true }; post({ type: 'nostr', ...chain.nostr });
+  if (h != null) { setVouched(nextVouched(chain.vouchedTo, { firstDiverged: h })); chain.nostr = { height: t.height, hash: t.hash, relay: t.relay, created_at: t.created_at, live: !!t.live, agree: 0, diverged: true, vouchedTo: chain.vouchedTo ?? null }; post({ type: 'nostr', ...chain.nostr });
     throw new Error(`block file disagrees with the NIP-333 headers at ${h}: nothing is applied or rolled back until they agree`); }
 }
 const tipFrom = (t, k, live) => ({ height: t.height, hash: t.hash, relay: t.relay, created_at: t.created_at, live, first: t.first, hashes: (t.headers ?? []).map((x) => k.codec.blockHash(x)) });
 // the signed tip this tab holds the chain to: never lowered by an older event or by none at all, and kept between sessions
 // (tip.json), so a relay that hands an old genuine tip cannot lower the floor the served chain and rollbacks are held to
 async function setTip(t) {
-  const prev = chain.tipHeaders; if (!t || higherTip(prev, t) !== t) return; /* lower than the floor: kept as it is */
+  const prev = chain.tipHeaders; if (!t || higherTip(prev, t) !== t) return; /* an older word than the one held: kept as it is */
   chain.tipHeaders = t;
-  if (!prev || t.height > prev.height || t.hash !== prev.hash) { try { await writeSmall('tip.json', JSON.stringify({ height: chain.tipHeaders.height, hash: chain.tipHeaders.hash, first: chain.tipHeaders.first, hashes: chain.tipHeaders.hashes, created_at: chain.tipHeaders.created_at })); } catch {} }
+  if (!prev || t.height !== prev.height || t.hash !== prev.hash) await saveTip();
 }
-async function loadTip() { if (chain.tipHeaders) return; try { const j = JSON.parse((await readSmall('tip.json')) ?? 'null'); if (j?.hashes?.length && j.first + j.hashes.length - 1 === j.height) chain.tipHeaders = { ...j, live: false, relay: 'this tab (kept)' }; } catch {} }
+// tip.json: the signed headers this tab holds the chain to, and how far its applied chain has been vouched for by them
+const saveTip = async () => { const t = chain.tipHeaders; if (!t) return; try { await writeSmall('tip.json', JSON.stringify({ height: t.height, hash: t.hash, first: t.first, hashes: t.hashes, created_at: t.created_at, vouchedTo: chain.vouchedTo ?? null })); } catch {} };
+function setVouched(v) { if (v === (chain.vouchedTo ?? null)) return; chain.vouchedTo = v; saveTip(); }
+async function loadTip() { if (chain.tipHeaders) return; try { const j = JSON.parse((await readSmall('tip.json')) ?? 'null'); if (j?.hashes?.length && j.first + j.hashes.length - 1 === j.height) { chain.tipHeaders = { ...j, live: false, relay: 'this tab (kept)' }; chain.vouchedTo = Number.isInteger(j.vouchedTo) ? j.vouchedTo : null; } } catch {} }
 async function sync(blocksUrl, { noScripts = false } = {}) {
   if (chain.syncing) return; chain.syncing = true; chain.syncAbort = new AbortController();
   const t0 = performance.now();
@@ -275,7 +279,9 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
       try { chain.deltas = JSON.parse((await readSmall('deltas.json')) ?? '[]'); if (!Array.isArray(chain.deltas)) throw new Error('not a list'); } catch (e) { chain.deltas = []; log(`the delta log could not be read (${e.message}): the blocks since the snapshot are validated again`); }
       let replayed = 0;
       for (const d of chain.deltas) {
-        if (d.height !== chain.node.height + 1 || (await chain.source.hash(d.height)) !== d.hash) { chain.deltas.length = replayed; break; }
+        // a block applied without its scripts checked (another page's no-scripts sync), or by an older node that did not say,
+        // is not replayed as validated: from there on the blocks are applied, and checked, again
+        if (d.height !== chain.node.height + 1 || !d.scripts || (await chain.source.hash(d.height)) !== d.hash) { chain.deltas.length = replayed; break; }
         const b = k.codec.decode('Block', await chain.source.blockHex(d.height)); chain.node.replay(d, b.header); replayed++; /* with its undo record: a reorg right after a reload is a pop, not a stop */
       }
       if (replayed) log(`replayed ${replayed} blocks from this tab's delta log`);
@@ -287,7 +293,7 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     if (nip) {
       const fresh = tipFrom(nip, k, false);
       for (let i = 0; i < nip.headers.length; i++) { const h = nip.first + i; const have = await chain.source.hash(h);
-        if (have && have !== fresh.hashes[i]) { chain.nostr = { height: nip.height, hash: nip.hash, relay: nip.relay, created_at: nip.created_at, agree: 0, diverged: true }; post({ type: 'nostr', ...chain.nostr }); throw new Error(`block file disagrees with the NIP-333 headers at ${h}`); } }
+        if (have && have !== fresh.hashes[i]) { setVouched(nextVouched(chain.vouchedTo, { firstDiverged: h })); chain.nostr = { height: nip.height, hash: nip.hash, relay: nip.relay, created_at: nip.created_at, agree: 0, diverged: true, vouchedTo: chain.vouchedTo ?? null }; post({ type: 'nostr', ...chain.nostr }); throw new Error(`block file disagrees with the NIP-333 headers at ${h}`); } }
       await setTip(fresh);
       judgeTip();
     }
@@ -296,13 +302,13 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     while (common > SNAPSHOT.baseHeight && (await chain.source.hash(common)) !== chain.node.chain[common]) common--;
     // a rollback that would replace blocks below the first one the signed headers cover is refused: nothing signed says it
     if (common < chain.node.height && !rollbackAllowed(common, chain.tipHeaders)) throw new Error(`the block file replaces blocks from ${common + 1}, below the signed chain tip's headers (from ${chain.tipHeaders.first}): refused until a signed tip covers it`);
-    if (common < chain.node.height) { log(`reorg: rolling back ${chain.node.height - common} block(s)`); chain.node.rollbackTo(common); chain.deltas = chain.deltas.filter((d) => d.height <= common); await writeSmall('deltas.json', JSON.stringify(chain.deltas)); judgeTip(); }
+    if (common < chain.node.height) { log(`reorg: rolling back ${chain.node.height - common} block(s)`); chain.node.rollbackTo(common); if (chain.vouchedTo != null && chain.vouchedTo > common) setVouched(common); /* what was vouched for above is gone */ chain.deltas = chain.deltas.filter((d) => d.height <= common); await writeSmall('deltas.json', JSON.stringify(chain.deltas)); judgeTip(); }
     const to = await chain.source.tip();
     let applied = 0, txs = 0;
     for (let h = chain.node.height + 1; h <= to; h++) {
       const r = chain.node.applyNext(h, await chain.source.blockHex(h));
       // a coin created and spent within the block is gone already and must not be replayed back
-      const uu = chain.node.undo.at(-1); chain.deltas.push({ height: h, hash: r.hash, spent: uu.spent.map(([key]) => key), created: uu.created.map((key) => [key, utxo.get(key)]).filter(([, c]) => c) });
+      const uu = chain.node.undo.at(-1); chain.deltas.push({ height: h, hash: r.hash, scripts: !noScripts, spent: uu.spent.map(([key]) => key), created: uu.created.map((key) => [key, utxo.get(key)]).filter(([, c]) => c) });
       applied++; txs += r.txs;
       if (applied % 20 === 0 || h === to) post({ type: 'progress', height: h, to, applied, txs, ms: performance.now() - t0, coins: utxo.size });
     }
@@ -314,7 +320,7 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     if (!chain.timer) {
       chain.timer = setInterval(() => queueSync(), 30_000);
       chain.noScripts = noScripts;
-      chain.tipSub = await subscribeTip(k, CHAIN.nip333, async (t) => { chain.tipAt = Date.now(); if (chain.tipHeaders && t.height < chain.tipHeaders.height) return; /* an older event replayed by a relay says nothing new */ await setTip(tipFrom(t, k, true)); judgeTip(); if (t.height > chain.node.height) setTimeout(() => queueSync(), 3000); }, { nostr, log });
+      chain.tipSub = await subscribeTip(k, CHAIN.nip333, async (t) => { chain.tipAt = Date.now(); /* an older event replayed by a relay is refused by setTip (older created_at) */ await setTip(tipFrom(t, k, true)); judgeTip(); if (t.height > chain.node.height) setTimeout(() => queueSync(), 3000); }, { nostr, log });
     }
   } finally { chain.syncing = false; chain.syncAbort = null; }
 }
@@ -345,8 +351,8 @@ const enqueue = (fn) => (queue = queue.then(fn).catch((err) => (err?.quiet ? log
 const quiet = (text) => Object.assign(new Error(text), { quiet: true });
 self.onmessage = (e) => { const m = e.data;
   if (m.type === 'ping') return post({ type: 'pong', t: m.t ?? null }); /* answered at once, outside the queue: the page's proof that the node is alive */
-  if (m.type === 'wake') { chain.tipSub?.reopen(); chain.mempoolSub?.reopen(); if (chain.syncing) chain.syncAbort?.abort(quiet('the page woke: a fresh sync replaces the one in flight')); }
-  else if (m.type === 'wipe') { if (chain.timer) { clearInterval(chain.timer); chain.timer = null; } clearInterval(chain.feedTimer); chain.tipHeaders = null; chain.syncAbort?.abort(quiet('wiping')); chain.fetchAbort.abort(quiet('wiping')); chain.cpuAbort = quiet('wiping'); try { chain.tipSub?.close(); chain.mempoolSub?.close(); chain.miner?.close?.(); } catch {} chain.tipSub = chain.mempoolSub = chain.miner = null; }
+  if (m.type === 'wake') { chain.tipSub?.reopen(); chain.mempoolSub?.reopen(); chain.beat?.(); if (chain.syncing) chain.syncAbort?.abort(quiet('the page woke: a fresh sync replaces the one in flight')); }
+  else if (m.type === 'wipe') { if (chain.timer) { clearInterval(chain.timer); chain.timer = null; } clearInterval(chain.feedTimer); chain.tipHeaders = null; chain.vouchedTo = null; chain.beat = null; chain.syncAbort?.abort(quiet('wiping')); chain.fetchAbort.abort(quiet('wiping')); chain.cpuAbort = quiet('wiping'); try { chain.tipSub?.close(); chain.mempoolSub?.close(); chain.miner?.close?.(); } catch {} chain.tipSub = chain.mempoolSub = chain.miner = null; }
   enqueue(() => handle(m)); };
 // the files' layout, read once: absent is written as this node's; newer stops everything but a wipe
 let layoutChecked = false;
@@ -404,7 +410,13 @@ async function handle(m) {
       if (m.seedUrl) { try { const { res: r, bytes } = await fetchIdle(m.seedUrl, { cache: 'no-store' }); if (r.ok) { const j = JSON.parse(new TextDecoder().decode(bytes)); let n = 0; await withSnapshot(() => { for (const t of j.txs ?? []) { if (rawAdd(t.hex, 'the mirror', 'seed').ok) n++; } }); log(`mempool: ${n} of ${(j.txs ?? []).length} from the mirror's file at height ${j.height}`); } } catch (e) { log(`mempool: seed file: ${e.message}`); } }
       // the broadcaster's heartbeat: the mirror's mempool file is rewritten by the estate's node on every pass (its `time`), whether
       // or not a transaction arrived; read every two minutes, so a page can tell a quiet chain from a stopped broadcaster
-      clearInterval(chain.feedTimer); const beat = async () => { try { const { res, bytes } = await fetchIdle(m.seedUrl, { cache: 'no-store' }, { totalMs: 30_000 }); if (res.ok) { const j = JSON.parse(new TextDecoder().decode(bytes)); if (Number.isFinite(j.time)) { mp.feedFileAt = j.time * 1000; postMempool(); } } } catch {} };
+      // The first read takes the file's own time; after that a HEAD request compares its ETag, and a changed file is a beat seen
+      // now (by this tab's clock, so a clock that is off does not matter); a server without ETags is read whole, as before
+      clearInterval(chain.feedTimer); let etag = null;
+      const beat = async () => { try {
+        if (etag) { const h = await fetch(m.seedUrl, { method: 'HEAD', cache: 'no-store', signal: deadline(30_000) }); const e = h.headers.get('etag'); if (h.ok && e) { if (e !== etag) { etag = e; mp.feedFileAt = Date.now(); postMempool(); } return; } }
+        const { res, bytes } = await fetchIdle(m.seedUrl, { cache: 'no-store' }, { totalMs: 30_000 }); if (res.ok) { etag = res.headers.get('etag'); const j = JSON.parse(new TextDecoder().decode(bytes)); if (Number.isFinite(j.time)) { mp.feedFileAt = j.time * 1000; postMempool(); } } } catch {} };
+      chain.beat = m.seedUrl ? beat : null;
       if (m.seedUrl) { beat(); chain.feedTimer = setInterval(beat, 120_000); }
       postMempool(true); }
     else if (m.type === 'mempool-list') postMempool(true);

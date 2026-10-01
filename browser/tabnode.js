@@ -47,11 +47,11 @@ const torrentFileUrl = (snapshotUrl) => snapshotUrl.replace(/\.dat$/, '') + '.to
 // INTEGRITY:BEGIN
 export const CODE_SHA256 = {
   'browser/blocks.js': 'd64c9d892a979502111c9ea1cf06ad7a588cd3b6e6d1e1dbb2d9f670de481573',
-  'browser/worker.js': 'a20a38434823e40266a617f612e1148bd1858fd45e7360ee1842d15814188c97',
+  'browser/worker.js': '03f22692171d92018bcd7b200049703544151779ef8ee28a784254b860de0b0e',
   'lib/bytes.mjs': 'c03070261249baaab1475caa4bf34f40c81556bc5fff97817c69951a356439d3',
-  'lib/mempool.mjs': '9222d51d073674901fb935217697f3fea2a25f4f90a41f6b927677f6a1c640dd',
-  'lib/nip333.mjs': '0e481426af4e98f1974684db90e7609f98da81d639e4c919f1a5a29aca0b2b8d',
-  'lib/node.mjs': 'ac395210ef0d6bf65160b50f7189984e8ba412aefd7768d0bdf584deda29f674',
+  'lib/mempool.mjs': 'c450a7274941cd642352d9dcbee760cd0d3324650c6cd834852931dae05c8580',
+  'lib/nip333.mjs': '1ffedac6e97962d0fe05b9bdccc81c6dcd2c1f2174296675199275a8992cfc8f',
+  'lib/node.mjs': '94713169c52c1443bc1def4cc0ede7647113b62da976bc8623b8018e5984e727',
   'lib/packed.mjs': 'bf79465a5bf4bfcbbec600d8f42b3ded81f1daf8a065ea95c4c08977460ceb3c',
   'lib/params.mjs': 'ff9abe2d6eca1b10460f4b74577ad56cfcc74fa2fa411903ee8cac9f18734058',
   'lib/sha256.mjs': '5150a47ad64ba86f527858f432bda497742b0548f71a3fbc1b0e1b1d04bbb9ce',
@@ -147,14 +147,14 @@ export function createTabNode({ base, snapshotUrl, blocksUrl, torrent = false, s
 
   // a worker that died (memory pressure on a phone) or hangs says nothing: a ping every 30 s, answered outside its queue; two
   // minutes without an answer is said as an error the page shows, and cleared when it answers again
-  // unresponsive is a state, not a stop: node.unresponsive is set and node.error carries UNRESPONSIVE (pages show it as a warning);
+  // unresponsive is a state, not a stop: node.unresponsive is set with node.unresponsiveText (pages show it as a warning), and node.error is untouched;
   // a page that was itself paused (asleep, a frozen background tab) does not count the pause against the worker
   let lastPong = Date.now(), lastPing = Date.now(); const UNRESPONSIVE = 'the node has not answered for two minutes (its worker may have been stopped by the browser): reload the page if it does not come back';
   const pinger = setInterval(() => { if (!worker) return; const now = Date.now(); const paused = now - lastPing > 60_000; lastPing = now; if (paused) { lastPong = now; post({ type: 'ping', t: now }); return; } post({ type: 'ping', t: now });
-    if (now - lastPong > 120_000 && !node.unresponsive) { node.unresponsive = true; node.error = UNRESPONSIVE; sync(UNRESPONSIVE, null); log(UNRESPONSIVE, 'err'); emit('unresponsive', {}); emit('message', { type: 'unresponsive' }); } }, 30_000); pinger.unref?.();
+    if (now - lastPong > 120_000 && !node.unresponsive) { node.unresponsive = true; node.unresponsiveText = UNRESPONSIVE; /* its own field: a real node.error (a mismatch, a disagreement) is never overwritten */ sync(UNRESPONSIVE, null); log(UNRESPONSIVE, 'err'); emit('unresponsive', {}); emit('message', { type: 'unresponsive' }); } }, 30_000); pinger.unref?.();
   // ---- the worker's messages: the loader takes the phases, the page gets every message after
   function onMessage(e) { const m = e.data;
-    if (m.type === 'pong') { lastPong = Date.now(); if (node.unresponsive) { node.unresponsive = false; if (node.error === UNRESPONSIVE) node.error = null; log('the node answers again'); sync(node.synced ? `Up to date · ${n(node.height)}` : 'the node answers again', null); emit('responsive', {}); emit('message', { type: 'responsive' }); } return; }
+    if (m.type === 'pong') { lastPong = Date.now(); if (node.unresponsive) { node.unresponsive = false; node.unresponsiveText = null; /* node.error is left as it was */ log('the node answers again'); sync(node.error ? 'Error: ' + node.error.slice(0, 140) : node.synced ? `Up to date · ${n(node.height)}` : 'the node answers again', null); emit('responsive', {}); emit('message', { type: 'responsive' }); } return; }
     if (m.type === 'status') { const first = !node.st; node.st = m; if (!first) seedStart(); if (first) { if (m.dat < m.expect.bytes) { if (opts.torrent) swarmFetch(m); else plainFetch(); } else if (!m.sha) hashPhase(); else if (m.idx <= 0) { seedStart(); verifyPhase(); } else { seedStart(); startSync(); } } }
     else if (m.type === 'fetch') { retryN = 0; node.retryAt = null; node.recv = m.have; sync(`Synchronizing with network… fetching the UTXO snapshot (${mib(m.have)} of ${mib(m.total)}, ${(m.rate / 1048576).toFixed(1)} MiB/s)`, m.have / m.total * 100, eta(m.have, m.total, node.fetchT0)); }
     else if (m.type === 'hashing') { sync(`Checking the snapshot's sha256… ${mib(m.at)} of ${mib(m.total)}`, m.at / m.total * 100, ''); }

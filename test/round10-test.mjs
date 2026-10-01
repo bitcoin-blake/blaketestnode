@@ -29,7 +29,7 @@ const nostr = { verifyNostrEvent: () => true };
   t('a tip from one relay is still a tip when the others fail', tip?.height === 90 && Date.now() - t0 < 1000);
 }
 {
-  const kept = { height: 100, hash: 'h100', first: 99, hashes: ['h99', 'h100'] }, older = { height: 90, hash: 'h90', first: 89, hashes: ['h89', 'h90'] }, newer = { height: 101, hash: 'h101', first: 100, hashes: ['h100', 'h101'] };
+  const kept = { height: 100, hash: 'h100', first: 99, hashes: ['h99', 'h100'], created_at: 100 }, older = { height: 90, hash: 'h90', first: 89, hashes: ['h89', 'h90'], created_at: 90 }, newer = { height: 101, hash: 'h101', first: 100, hashes: ['h100', 'h101'], created_at: 101 };
   t('the kept tip is not lowered by an older one, nor by none', higherTip(kept, older) === kept && higherTip(kept, null) === kept);
   t('a newer tip replaces it; with nothing kept, the fresh one is taken', higherTip(kept, newer) === newer && higherTip(null, older) === older);
 }
@@ -44,6 +44,6 @@ const nostr = { verifyNostrEvent: () => true };
 {
   const feed = 'f'.repeat(64), other = 'o'.repeat(64);
   t('a kind 23404 event from the estate\'s key is a feed entry; anyone else\'s is a relay echo; a wallet\'s payment event is an echo', viaOf({ kind: MEMPOOL_KIND, pubkey: feed }, [feed]) === 'feed' && viaOf({ kind: MEMPOOL_KIND, pubkey: other }, [feed]) === 'relay' && viaOf({ kind: 23503, pubkey: feed }, [feed]) === 'relay');
-  t('with no allowlist known, 23404 stays a feed entry (the old behaviour)', viaOf({ kind: MEMPOOL_KIND, pubkey: other }, null) === 'feed');
+  t('with no allowlist known, no relay event is a feed entry ("fed" comes from the mirror\'s file only)', viaOf({ kind: MEMPOOL_KIND, pubkey: other }, null) === 'relay');
 }
 console.log(`\n${ok} passed, ${bad} failed`); process.exit(bad ? 1 : 0);
