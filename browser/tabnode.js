@@ -65,13 +65,18 @@ async function sha256hex(text) { const b = new Uint8Array(await crypto.subtle.di
 // fetch `path` (relative to the repository at `base`), check it, bring in its relative imports the same way (as blob URLs),
 // and give back its text with those imports pointing at the checked copies. Imports of other repositories (the engine,
 // sidestr) stay as they are: pinned by commit, and the engine's rule files are checked by hash in the worker.
-export async function workerSource(base, { entry = 'browser/worker.js', fetchText = null } = {}) {
+// Every file of the table is asked for at once (one after another took about 20 s over a CDN): the texts are then checked and
+// their imports resolved exactly as before, so a file that differs is still refused by name. onProgress(k, n) as files arrive.
+export async function workerSource(base, { entry = 'browser/worker.js', fetchText = null, onProgress = null } = {}) {
   const host = base.replace(/^https?:\/\//, '').split('/')[0]; const blobs = new Map();
   const get = fetchText ?? (async (path) => { let r; try { r = await fetch(`${base}/${path}`, { signal: timeoutSignal(30_000) }); } catch (e) { throw new Error(`the node's code could not be loaded from ${host} (${e?.name === 'TimeoutError' || e?.name === 'AbortError' ? 'no answer in 30 s' : e.message}): check the connection and reload`); } if (!r.ok) throw new Error(`the node's code could not be loaded from ${host} (${path} answered ${r.status}): check the connection and reload`); return r.text(); });
   const resolve = (from, rel) => { const parts = from.split('/').slice(0, -1); for (const p of rel.split('/')) { if (p === '..') parts.pop(); else if (p !== '.') parts.push(p); } return parts.join('/'); };
+  const paths = Object.keys(CODE_SHA256); let arrived = 0;
+  const fetched = new Map(paths.map((path) => [path, get(path).then((text) => { arrived++; onProgress?.(arrived, paths.length); return text; })]));
+  await Promise.all(fetched.values()); // the first failure stops here, said in words, before anything is checked or run
   const load = async (path, top) => {
     if (blobs.has(path)) return blobs.get(path);
-    const text = await get(path); const want = CODE_SHA256[path];
+    const text = await (fetched.get(path) ?? get(path)); const want = CODE_SHA256[path];
     if (!want) throw new Error(`the node's ${path} is not in this loader's table of checked files: nothing was started`);
     if ((await sha256hex(text)) !== want) throw new Error(`the node's ${path} from ${host} is not the pinned file (its sha256 differs): nothing was started`);
     let out = text; for (const m of [...text.matchAll(/from '(\.{1,2}\/[^']+)'/g)]) { const dep = resolve(path, m[1]); out = out.split(`from '${m[1]}'`).join(`from '${await load(dep, false)}'`); }
@@ -180,13 +185,14 @@ export function createTabNode({ base, snapshotUrl, blocksUrl, torrent = false, s
   // and says so; start() resolves false then. The lock is held for the life of the page.
   // start({ force: true }) runs without the lock, for a browser whose lock API fails; the page asks the person first
   async function start({ force = false } = {}) { if (navigator.locks && opts.lock !== false && !force) { const got = await new Promise((res) => navigator.locks.request('bitcoin-blake:node', { signal: timeoutSignal(3000) }, () => { res(true); return new Promise(() => {}); }).catch((e) => { if (e?.name !== 'AbortError' && e?.name !== 'TimeoutError') node.lockError = e?.message || String(e); res(false); })); /* a reload of the same tab can find the lock still held by the page it replaces: wait up to three seconds */ if (!got && node.lockError) { node.phase = 'busy'; sync('the browser refused the lock that keeps one node per browser: ' + node.lockError, null); emit('busy', { error: node.lockError }); return false; } if (!got) { node.busy = true; node.phase = 'busy'; sync('idle: the node runs in another tab of this browser (Reef, Bight, Winch or Hitch)', null); emit('busy', {}); return false; } }
+    sync('Starting the node: loading its code…', null); /* said as soon as this tab holds the lock, before the code is fetched */
     return startWorker(); }
   let workerSrc = null;
   const spawn = () => { worker = new Worker(URL.createObjectURL(new Blob([workerSrc], { type: 'text/javascript' })), { type: 'module' }); worker.onmessage = onMessage; worker.onerror = (e) => { node.error = e.message || 'worker failed'; node.errorName = null; sync('Error: ' + node.error, null); log('worker error: ' + node.error, 'err'); }; lastPong = Date.now(); };
   async function startWorker() {
     // the node's code from the CDN, each file checked against the hashes this loader carries (a CDN serving other code would
     // run another node beside the wallet's key): a hang, an error page or a changed file stops here, said in words
-    workerSrc = await workerSource(base);
+    workerSrc = await workerSource(base, { onProgress: (k, n) => sync(`Starting the node: loading its code (${k} of ${n})…`, null) });
     spawn();
     sync('Starting the node…', null); log('loading the node from ' + base.replace('https://cdn.jsdelivr.net/gh/', '')); post({ type: 'status' }); return true; }
 
