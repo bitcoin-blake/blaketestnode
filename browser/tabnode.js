@@ -47,10 +47,10 @@ const torrentFileUrl = (snapshotUrl) => snapshotUrl.replace(/\.dat$/, '') + '.to
 // INTEGRITY:BEGIN
 export const CODE_SHA256 = {
   'browser/blocks.js': 'd64c9d892a979502111c9ea1cf06ad7a588cd3b6e6d1e1dbb2d9f670de481573',
-  'browser/worker.js': '03f22692171d92018bcd7b200049703544151779ef8ee28a784254b860de0b0e',
+  'browser/worker.js': '8ac59b8fc6f249122241a4efb5001d25fdf3281c38ae5a31960fba45450de1cf',
   'lib/bytes.mjs': 'c03070261249baaab1475caa4bf34f40c81556bc5fff97817c69951a356439d3',
-  'lib/mempool.mjs': 'c450a7274941cd642352d9dcbee760cd0d3324650c6cd834852931dae05c8580',
-  'lib/nip333.mjs': '1ffedac6e97962d0fe05b9bdccc81c6dcd2c1f2174296675199275a8992cfc8f',
+  'lib/mempool.mjs': 'cd6fb29f9ad4c30e2430516a1cf2c2b43883a611e15bc6084df57068565bad23',
+  'lib/nip333.mjs': 'b37f010aa720237014d61633c4c26d0d6571fb38e27d6165a58d6c85df1b05a3',
   'lib/node.mjs': '94713169c52c1443bc1def4cc0ede7647113b62da976bc8623b8018e5984e727',
   'lib/packed.mjs': 'bf79465a5bf4bfcbbec600d8f42b3ded81f1daf8a065ea95c4c08977460ceb3c',
   'lib/params.mjs': 'ff9abe2d6eca1b10460f4b74577ad56cfcc74fa2fa411903ee8cac9f18734058',
@@ -139,7 +139,7 @@ export function createTabNode({ base, snapshotUrl, blocksUrl, torrent = false, s
   // a network error by itself with a growing wait (5 s … 5 min)
   let retryTimer = null, retryN = 0;
   const retrySync = () => { clearTimeout(retryTimer); retryTimer = null; node.retryAt = null; node.lastError = { text: node.error, at: Date.now() }; node.error = null; log('looking for the blocks again'); startSync(); };
-  let hiddenAt = null; const wake = () => { if (!worker) return; if (node.phase === 'fetch' && node.error && !swarm) { clearTimeout(retryTimer); retryTimer = null; node.lastError = { text: node.error, at: Date.now() }; node.error = null; log('the connection is back: resuming the snapshot'); plainFetch(); } else if (node.phase === 'sync' && node.error && !node.synced) retrySync(); else if (node.synced) post({ type: 'wake' }); };
+  let hiddenAt = null; const wake = () => { if (!worker || node.phase === 'wiped') return; /* a wiped node waits to be started again */ if (node.phase === 'fetch' && node.error && !swarm) { clearTimeout(retryTimer); retryTimer = null; node.lastError = { text: node.error, at: Date.now() }; node.error = null; log('the connection is back: resuming the snapshot'); plainFetch(); } else if (node.phase === 'sync' && node.error && !node.synced) retrySync(); else if (node.synced) post({ type: 'wake' }); };
   globalThis.document?.addEventListener?.('visibilitychange', () => { if (document.visibilityState === 'hidden') hiddenAt = Date.now(); else { if (hiddenAt && Date.now() - hiddenAt > 60_000) wake(); hiddenAt = null; } });
   addEventListener('online', wake);
   // a laptop that slept with the tab in front fires neither of those: timers stop while asleep, so a long gap between ticks says it
@@ -193,7 +193,9 @@ export function createTabNode({ base, snapshotUrl, blocksUrl, torrent = false, s
     followMempool({ relays, also = [23503], seedUrl = blocksUrl.replace(/-blocks$/, '-mempool.json') }) { post({ type: 'mempool', relays, also, seedUrl }); },
     // resolves once the node's files are removed ({ removed, failed }). A worker that does not answer in `timeoutMs` (busy, or
     // stuck) is stopped and a fresh one wipes; that one has another `timeoutMs`, else this rejects and nothing is pending
-    wipe({ timeoutMs = 20_000 } = {}) { swarmTeardown(true);
+    // this clock against the real one (seconds, + when fast): the live signed tip looks back that much further
+    setSkew(s) { post({ type: 'skew', s }); },
+    wipe({ timeoutMs = 20_000 } = {}) { swarmTeardown(true); clearTimeout(retryTimer); retryTimer = null; node.retryAt = null; node.phase = 'wiped'; /* no retry or wake restarts a node being wiped */
       const once = () => new Promise((resolve, reject) => { const off = on('wiped', (m) => { clearTimeout(t); off(); resolve({ removed: m.removed, failed: m.failed }); });
         const t = setTimeout(() => { off(); reject(new Error('timeout')); }, timeoutMs); post({ type: 'wipe' }); });
       return seedStop().then(async () => { if (!worker) throw new Error('the node is not running in this tab');

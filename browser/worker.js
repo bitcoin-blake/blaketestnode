@@ -6,7 +6,7 @@ import { buildIndexAsync, indexBytes, parseIndexBytes } from '../lib/packed.mjs'
 import { bytesToHex } from '../lib/bytes.mjs';
 import { PackedUtxo } from '../lib/packed.mjs';
 import { ChainNode, checkContextHeaders } from '../lib/node.mjs';
-import { fetchTip, subscribeTip, judgeTip as judge, servedDisagreement, rollbackAllowed, higherTip, nextVouched } from '../lib/nip333.mjs';
+import { fetchTip, subscribeTip, judgeTip as judge, servedDisagreement, rollbackAllowed, higherTip, nextVouched, vouchedUnder, tooNew } from '../lib/nip333.mjs';
 import { buildTemplate, checkTemplate } from '../lib/template.mjs';
 import { makeWebMiner } from '../lib/webminer.mjs';
 const SIDESTR = 'https://cdn.jsdelivr.net/gh/sidestr/spec@cec654b7d06907130700fe52c66c3f9d0921495d/siding/lib';
@@ -166,7 +166,7 @@ async function verify() {
 // anywhere is then fixed by a wipe; answered with 'wiped' and what could not be removed
 async function wipe() {
   const d = await dir(); let names = [];
-  try { for await (const [name] of d.entries()) names.push(name); } catch { names = [SNAPSHOT.file, `${SNAPSHOT.file}.idx`, `${SNAPSHOT.file}.sha256`, `${SNAPSHOT.file}.ranges`, `${SNAPSHOT.file}.part`, 'blocks.dat', 'blocks.json', 'deltas.json', 'context-headers.json', `context-headers-${SNAPSHOT.baseHeight}.json`]; }
+  try { for await (const [name] of d.entries()) names.push(name); } catch { names = [SNAPSHOT.file, `${SNAPSHOT.file}.idx`, `${SNAPSHOT.file}.sha256`, `${SNAPSHOT.file}.ranges`, `${SNAPSHOT.file}.part`, 'blocks.dat', 'blocks.json', 'deltas.json', 'tip.json', 'context-headers.json', `context-headers-${SNAPSHOT.baseHeight}.json`]; }
   const removed = [], failed = [];
   for (const n of names) { try { await d.removeEntry(n, { recursive: true }); removed.push(n); } catch (e) { if (e?.name !== 'NotFoundError') failed.push(`${n}: ${e.message}`); } }
   layoutChecked = false;
@@ -248,12 +248,14 @@ const tipFrom = (t, k, live) => ({ height: t.height, hash: t.hash, relay: t.rela
 async function setTip(t) {
   const prev = chain.tipHeaders; if (!t || higherTip(prev, t) !== t) return; /* an older word than the one held: kept as it is */
   chain.tipHeaders = t;
+  const v = vouchedUnder(chain.vouchedTo, t); if (v !== (chain.vouchedTo ?? null)) { chain.vouchedTo = v; return saveTip(); } /* not vouched above what the publisher now signs */
   if (!prev || t.height !== prev.height || t.hash !== prev.hash) await saveTip();
 }
 // tip.json: the signed headers this tab holds the chain to, and how far its applied chain has been vouched for by them
-const saveTip = async () => { const t = chain.tipHeaders; if (!t) return; try { await writeSmall('tip.json', JSON.stringify({ height: t.height, hash: t.hash, first: t.first, hashes: t.hashes, created_at: t.created_at, vouchedTo: chain.vouchedTo ?? null })); } catch {} };
+const saveTip = async () => { const t = chain.tipHeaders; if (!t) return; try { await writeSmall('tip.json', JSON.stringify({ height: t.height, hash: t.hash, first: t.first, hashes: t.hashes, created_at: t.created_at, vouchedTo: chain.vouchedTo ?? null, source: chain.blocksUrl ?? null })); } catch {} };
 function setVouched(v) { if (v === (chain.vouchedTo ?? null)) return; chain.vouchedTo = v; saveTip(); }
-async function loadTip() { if (chain.tipHeaders) return; try { const j = JSON.parse((await readSmall('tip.json')) ?? 'null'); if (j?.hashes?.length && j.first + j.hashes.length - 1 === j.height) { chain.tipHeaders = { ...j, live: false, relay: 'this tab (kept)' }; chain.vouchedTo = Number.isInteger(j.vouchedTo) ? j.vouchedTo : null; } } catch {} }
+async function loadTip() { if (chain.tipHeaders) return; try { const j = JSON.parse((await readSmall('tip.json')) ?? 'null'); if (j?.hashes?.length && j.first + j.hashes.length - 1 === j.height && !tooNew(j.created_at)) { chain.tipHeaders = { ...j, live: false, relay: 'this tab (kept)' };
+  /* a vouched height counted against another block source is not this one's: counted again from the signed headers */ chain.vouchedTo = Number.isInteger(j.vouchedTo) && (j.source == null || j.source === chain.blocksUrl) ? vouchedUnder(j.vouchedTo, j) : null; } } catch {} }
 async function sync(blocksUrl, { noScripts = false } = {}) {
   if (chain.syncing) return; chain.syncing = true; chain.syncAbort = new AbortController();
   const t0 = performance.now();
@@ -261,6 +263,7 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     const { k, nostr } = await loadEngine();
     if (noScripts) k.blocks.interpreter = null;
     const utxo = await loadSet();
+    if (chain.blocksUrl && chain.blocksUrl !== blocksUrl && chain.vouchedTo != null) { chain.blocksUrl = blocksUrl; setVouched(null); } /* another block source: nothing it serves is vouched for yet */
     chain.blocksUrl = blocksUrl;
     chain.source ??= new OpfsBlockSource(k, blocksUrl, files, { log, signal: () => chain.syncAbort?.signal ?? null });
     await loadTip();
@@ -285,6 +288,7 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
         const b = k.codec.decode('Block', await chain.source.blockHex(d.height)); chain.node.replay(d, b.header); replayed++; /* with its undo record: a reorg right after a reload is a pop, not a stop */
       }
       if (replayed) log(`replayed ${replayed} blocks from this tab's delta log`);
+      if (chain.vouchedTo != null && chain.vouchedTo > chain.node.height) setVouched(chain.node.height); /* the log broke off: what is applied again is vouched again */
     }
     // the relays' word on the tip, checked against the file's tail: fetched on the first sync, then only when the live
     // subscription has said nothing for ten minutes (a fetch opens a socket per relay; every 30 s that is thousands a day)
@@ -320,7 +324,7 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     if (!chain.timer) {
       chain.timer = setInterval(() => queueSync(), 30_000);
       chain.noScripts = noScripts;
-      chain.tipSub = await subscribeTip(k, CHAIN.nip333, async (t) => { chain.tipAt = Date.now(); /* an older event replayed by a relay is refused by setTip (older created_at) */ await setTip(tipFrom(t, k, true)); judgeTip(); if (t.height > chain.node.height) setTimeout(() => queueSync(), 3000); }, { nostr, log });
+      chain.tipSub = await subscribeTip(k, CHAIN.nip333, async (t) => { chain.tipAt = Date.now(); /* an older event replayed by a relay is refused by setTip (older created_at) */ await setTip(tipFrom(t, k, true)); judgeTip(); if (t.height > chain.node.height) setTimeout(() => queueSync(), 3000); }, { nostr, log, skewS: () => chain.skewS ?? 0 });
     }
   } finally { chain.syncing = false; chain.syncAbort = null; }
 }
@@ -351,9 +355,11 @@ const enqueue = (fn) => (queue = queue.then(fn).catch((err) => (err?.quiet ? log
 const quiet = (text) => Object.assign(new Error(text), { quiet: true });
 self.onmessage = (e) => { const m = e.data;
   if (m.type === 'ping') return post({ type: 'pong', t: m.t ?? null }); /* answered at once, outside the queue: the page's proof that the node is alive */
+  if (m.type === 'skew') { chain.skewS = Number.isFinite(Number(m.s)) ? Number(m.s) : 0; return; } /* the page's measure of this clock against the real one, in seconds: the live tip's look-back */
   if (m.type === 'wake') { chain.tipSub?.reopen(); chain.mempoolSub?.reopen(); chain.beat?.(); if (chain.syncing) chain.syncAbort?.abort(quiet('the page woke: a fresh sync replaces the one in flight')); }
   else if (m.type === 'wipe') { if (chain.timer) { clearInterval(chain.timer); chain.timer = null; } clearInterval(chain.feedTimer); chain.tipHeaders = null; chain.vouchedTo = null; chain.beat = null; chain.syncAbort?.abort(quiet('wiping')); chain.fetchAbort.abort(quiet('wiping')); chain.cpuAbort = quiet('wiping'); try { chain.tipSub?.close(); chain.mempoolSub?.close(); chain.miner?.close?.(); } catch {} chain.tipSub = chain.mempoolSub = chain.miner = null; }
   enqueue(() => handle(m)); };
+let reseeding = false;
 // the files' layout, read once: absent is written as this node's; newer stops everything but a wipe
 let layoutChecked = false;
 async function checkLayout() {
@@ -379,7 +385,8 @@ async function handle(m) {
       const { k } = await loadEngine(); if (!chain.source?.byHeight) throw new Error('sync first');
       const height = m.hash ? [...chain.source.byHeight.values()].find((e) => e.hash === String(m.hash).toLowerCase())?.height : Number(m.height); const e = height != null && !Number.isNaN(height) ? applied(height) : null; if (!e) throw new Error('Block not found');
       const block = k.codec.decode('Block', await chain.source.blockHex(height)); const txids = block.transactions.map((tx) => k.codec.txid(tx));
-      post({ type: 'block', height, hash: e.hash, size: e.size, header: block.header, nTx: txids.length, txids, previousblockhash: block.header.prevBlockHash, nextblockhash: chain.source.byHeight.get(height + 1)?.hash ?? null, confirmations: chain.node ? chain.node.height - height + 1 : null, req: m.req ?? null }); });
+      const coinbaseValue = (block.transactions[0]?.outputs ?? []).reduce((a, o) => a + Number(o.value), 0); /* subsidy plus fees: a page's fee figure */
+      post({ type: 'block', height, hash: e.hash, size: e.size, header: block.header, nTx: txids.length, txids, coinbaseValue, previousblockhash: block.header.prevBlockHash, nextblockhash: chain.source.byHeight.get(height + 1)?.hash ?? null, confirmations: chain.node ? chain.node.height - height + 1 : null, req: m.req ?? null }); });
     else if (m.type === 'watch') { watch.scripts = new Set(m.scripts ?? []); watch.outpoints = new Set(m.outpoints ?? []); postMempool(true); }
     else if (m.type === 'coins') await withSnapshot(async () => { // the unspent coins paying a script, among those created since the snapshot (a page wallet's balance)
       if (!chain.utxo) throw new Error('sync first'); const want = String(m.script).toLowerCase(); const out = [];
@@ -403,7 +410,7 @@ async function handle(m) {
       post({ type: 'tx', txid: m.txid, height: Number(m.height), found: !!tx, hex: tx ? k.codec.encodeHex('Transaction', tx) : null, req: m.req ?? null }); });
     else if (m.type === 'mempool') { // datstr SPEC 6.3: transactions from relays, validated here; a seed file from the mirror fills it on start
       const { k, nostr } = await loadEngine(); if (!chain.node) throw new Error('sync first'); if (chain.mempoolSub) chain.mempoolSub.close();
-      const mp = new Mempool({ k, node: chain.node, network: CHAIN.network, log, onChange: () => postMempool(), onRefuse: (r, tx) => { if (tx && (tx.inputs.some((i) => watch.outpoints.has(`${i.prevout.txid}:${i.prevout.vout}`)) || tx.outputs.some((o) => watch.scripts.has(o.scriptPubKey)))) post({ type: 'refused', txid: r.txid, error: r.error, hex: r.hex }); /* the exact bytes: a copy with a broken signature has the same txid */ } }); chain.mempool = mp;
+      const mp = new Mempool({ k, node: chain.node, network: CHAIN.network, log, onChange: () => postMempool(), onRefuse: (r, tx) => { if (reseeding) return; /* the file read again: one it lists that was mined since is not a refusal of the page's */ if (tx && (tx.inputs.some((i) => watch.outpoints.has(`${i.prevout.txid}:${i.prevout.vout}`)) || tx.outputs.some((o) => watch.scripts.has(o.scriptPubKey)))) post({ type: 'refused', txid: r.txid, error: r.error, hex: r.hex }); /* the exact bytes: a copy with a broken signature has the same txid */ } }); chain.mempool = mp;
       // a check reads the UTXO set, which needs the snapshot attached: adds from the relays are queued as jobs like everything else
       const rawAdd = mp.add.bind(mp); mp.add = (hex, from, via) => { if (via === 'feed') mp.lastFeedAt = Date.now(); enqueue(() => withSnapshot(() => { rawAdd(hex, from, via); })); return { ok: true, queued: true }; };
       chain.mempoolSub = await subscribeMempool(mp, { relays: m.relays, network: CHAIN.network, nostr, also: m.also ?? [], log, feedPublishers: CHAIN.mempoolFeed?.publishers ?? null });
@@ -412,10 +419,18 @@ async function handle(m) {
       // or not a transaction arrived; read every two minutes, so a page can tell a quiet chain from a stopped broadcaster
       // The first read takes the file's own time; after that a HEAD request compares its ETag, and a changed file is a beat seen
       // now (by this tab's clock, so a clock that is off does not matter); a server without ETags is read whole, as before
-      clearInterval(chain.feedTimer); let etag = null;
+      // A changed file is read again: what it lists is what a node has, so a payment sent after the tab started is told "fed"
+      // too (a transaction this pool holds is marked; one it lacks is added, as the first read does)
+      clearInterval(chain.feedTimer); let etag = null, reads = 0;
+      const read = async (changed) => { const { res, bytes } = await fetchIdle(m.seedUrl, { cache: 'no-store' }, { totalMs: 30_000 }); if (!res.ok) return;
+        etag = res.headers.get('etag'); const j = JSON.parse(new TextDecoder().decode(bytes)); const txs = Array.isArray(j.txs) ? j.txs : [];
+        if (changed) mp.feedFileAt = Date.now(); else if (Number.isFinite(j.time)) mp.feedFileAt = j.time * 1000;
+        if (reads++ > 0) { mp.markFed(txs.map((t) => t.txid).filter(Boolean)); const fresh = txs.filter((t) => t.hex && !mp.txs.has(String(t.txid).toLowerCase()));
+          if (fresh.length) enqueue(() => withSnapshot(() => { reseeding = true; try { for (const t of fresh) rawAdd(t.hex, 'the mirror', 'seed'); } finally { reseeding = false; } })); }
+        postMempool(); };
       const beat = async () => { try {
-        if (etag) { const h = await fetch(m.seedUrl, { method: 'HEAD', cache: 'no-store', signal: deadline(30_000) }); const e = h.headers.get('etag'); if (h.ok && e) { if (e !== etag) { etag = e; mp.feedFileAt = Date.now(); postMempool(); } return; } }
-        const { res, bytes } = await fetchIdle(m.seedUrl, { cache: 'no-store' }, { totalMs: 30_000 }); if (res.ok) { etag = res.headers.get('etag'); const j = JSON.parse(new TextDecoder().decode(bytes)); if (Number.isFinite(j.time)) { mp.feedFileAt = j.time * 1000; postMempool(); } } } catch {} };
+        if (etag) { const h = await fetch(m.seedUrl, { method: 'HEAD', cache: 'no-store', signal: deadline(30_000) }); const e = h.headers.get('etag'); if (h.ok && e) { if (e !== etag) await read(true); return; } }
+        await read(false); } catch {} };
       chain.beat = m.seedUrl ? beat : null;
       if (m.seedUrl) { beat(); chain.feedTimer = setInterval(beat, 120_000); }
       postMempool(true); }
