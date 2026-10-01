@@ -82,6 +82,11 @@ export function createTabNode({ base, snapshotUrl, blocksUrl, torrent = false, s
     } catch (e) { stop(e.message); } }
   function seedStop() { const s = seeding; seeding = null; if (!s) return Promise.resolve(); clearInterval(s.tick); try { s.client?.destroy(); } catch {} emit('seeding', null); return s.sw.rpc({ t: 'close' }).catch(() => {}).then(() => s.sw.terminate()); }
   addEventListener('beforeunload', () => { swarmTeardown(false); seedStop(); });
+  // after a sleep (hidden more than a minute) or a lost connection, the worker opens its relay sockets again and looks for
+  // blocks; a snapshot download that stopped for want of a connection resumes where it stopped (its journal lists the ranges)
+  let hiddenAt = null; const wake = () => { if (!worker) return; if (node.phase === 'fetch' && node.error && !swarm) { node.lastError = { text: node.error, at: Date.now() }; node.error = null; log('the connection is back: resuming the snapshot'); plainFetch(); } else if (node.synced) post({ type: 'wake' }); };
+  globalThis.document?.addEventListener?.('visibilitychange', () => { if (document.visibilityState === 'hidden') hiddenAt = Date.now(); else { if (hiddenAt && Date.now() - hiddenAt > 60_000) wake(); hiddenAt = null; } });
+  addEventListener('online', wake);
 
   // ---- the worker's messages: the loader takes the phases, the page gets every message after
   function onMessage(e) { const m = e.data;

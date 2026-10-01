@@ -78,25 +78,34 @@ async function fetchSnapshot(url, { parallel = 6, chunk = 32 << 20 } = {}) {
   let journalLock = Promise.resolve(); // one sync access handle at a time on the journal
   const journal = () => (journalLock = journalLock.then(() => writeSmall(journalName, JSON.stringify({ chunk, done: [...done] }))).catch(() => {}));
   const report = () => { if (performance.now() - lastReport > 250) { lastReport = performance.now(); post({ type: 'fetch', have: have + got, total: SNAPSHOT.bytes, rate: got / ((performance.now() - t0) / 1000) }); } };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  let stopErr = null; // the first range that gives up stops the others, so the handle is closed only when none writes
   const pull = async () => {
     for (;;) {
-      const r = ranges.shift(); if (!r) return;
+      if (stopErr) return; const r = ranges.shift(); if (!r) return;
       const [ci, start, end] = r; let at = start;
       for (let attempt = 0; ; attempt++) {
         try {
           const res = await fetch(url, { headers: { range: `bytes=${at}-${end}` }, cache: 'no-store' });
           if (res.status !== 206) throw new Error(`server answered ${res.status} to a range request (needs Range and CORS)`);
           const reader = res.body.getReader();
-          for (;;) { const { value, done } = await reader.read(); if (done) break; h.write(value, { at }); at += value.length; got += value.length; report(); }
+          for (;;) { if (stopErr) { reader.cancel().catch(() => {}); return; } const { value, done } = await reader.read(); if (done) break; h.write(value, { at }); at += value.length; got += value.length; report(); }
           if (at !== end + 1) throw new Error(`short range: got to ${at}, wanted ${end + 1}`);
           h.flush(); done.add(ci); await journal();
           break;
-        } catch (e) { if (attempt >= 3) throw e; log(`range ${ci}: ${e.message}, retrying`); got -= at - start; at = start; }
+        } catch (e) {
+          got -= at - start; at = start; if (stopErr) return;
+          /* offline: wait for the connection without counting it as an attempt; online: back off 1, 2, 4 … 60 s, then give up */
+          if (navigator.onLine === false) { log(`range ${ci}: offline, waiting for the connection`); while (navigator.onLine === false && !stopErr) await sleep(2000); attempt--; continue; }
+          if (attempt >= 7) { stopErr ??= e; return; }
+          const wait = Math.min(60_000, 1000 * 2 ** attempt); log(`range ${ci}: ${e.message}, retrying in ${wait / 1000} s`); await sleep(wait);
+        }
       }
     }
   };
-  await Promise.all(Array.from({ length: Math.min(parallel, ranges.length) }, pull));
-  h.flush(); h.close();
+  try { await Promise.allSettled(Array.from({ length: Math.min(parallel, ranges.length) }, () => pull().catch((e) => { stopErr ??= e; }))); }
+  finally { try { h.flush(); } catch {} try { h.close(); } catch {} }
+  if (stopErr) throw new Error(`${stopErr.message}; what arrived is kept, and the fetch resumes from there`);
   const ms = performance.now() - t0;
   post({ type: 'fetch', have: SNAPSHOT.bytes, total: SNAPSHOT.bytes, rate: total / (ms / 1000) });
   log(`fetched ${(total / 1048576).toFixed(0)} MiB in ${(ms / 1000).toFixed(1)} s (${(total / 1048576 / (ms / 1000)).toFixed(1)} MiB/s), hashing the file`);
@@ -199,13 +208,14 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
       let replayed = 0;
       for (const d of chain.deltas) {
         if (d.height !== chain.node.height + 1 || (await chain.source.hash(d.height)) !== d.hash) { chain.deltas.length = replayed; break; }
-        for (const key of d.spent) utxo.delete(key); for (const [key, coin] of d.created) if (coin) utxo.set(key, coin);
-        const b = k.codec.decode('Block', await chain.source.blockHex(d.height)); chain.node.headers[d.height] = b.header; chain.node.chain[d.height] = d.hash; chain.node.height = d.height; replayed++;
+        const b = k.codec.decode('Block', await chain.source.blockHex(d.height)); chain.node.replay(d, b.header); replayed++; /* with its undo record: a reorg right after a reload is a pop, not a stop */
       }
       if (replayed) log(`replayed ${replayed} blocks from this tab's delta log`);
     }
-    // the relays' word on the tip, checked against the file's tail
-    const nip = await fetchTip(k, CHAIN.nip333, { nostr });
+    // the relays' word on the tip, checked against the file's tail: fetched on the first sync, then only when the live
+    // subscription has said nothing for ten minutes (a fetch opens a socket per relay; every 30 s that is thousands a day)
+    const nip = !chain.tipAt || Date.now() - chain.tipAt > 600_000 ? await fetchTip(k, CHAIN.nip333, { nostr }) : null;
+    if (!chain.tipAt || Date.now() - chain.tipAt > 600_000) chain.tipAt = Date.now();
     if (nip) {
       let agree = 0; for (let i = 0; i < nip.headers.length; i++) { const h = nip.first + i; const have = await chain.source.hash(h); if (have && have !== k.codec.blockHash(nip.headers[i])) throw new Error(`block file disagrees with the NIP-333 headers at ${h}`); if (have) agree++; }
       chain.nostr = { height: nip.height, hash: nip.hash, relay: nip.relay, created_at: nip.created_at, agree };
@@ -230,7 +240,8 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     post({ type: 'synced', height: chain.node.height, hash: chain.node.tipHash(), time: chain.node.headers[chain.node.height]?.time ?? null, coins: utxo.size, applied, txs, ms: performance.now() - t0, stats: chain.node.stats, scripts: !noScripts, quiet: applied === 0 && !!chain.timer });
     if (!chain.timer) {
       chain.timer = setInterval(() => enqueue(() => withSnapshot(() => sync(chain.blocksUrl, { noScripts }))), 30_000);
-      subscribeTip(k, CHAIN.nip333, (t) => { chain.nostr = { ...t, agree: chain.node.chain[t.height] === t.hash ? 1 : 0, diverged: !!chain.node.chain[t.height] && chain.node.chain[t.height] !== t.hash }; post({ type: 'nostr', ...chain.nostr, live: true }); if (t.height > chain.node.height) setTimeout(() => enqueue(() => withSnapshot(() => sync(chain.blocksUrl, { noScripts }))), 3000); }, { nostr, log });
+      chain.noScripts = noScripts;
+      chain.tipSub = await subscribeTip(k, CHAIN.nip333, (t) => { chain.tipAt = Date.now(); chain.nostr = { ...t, agree: chain.node.chain[t.height] === t.hash ? 1 : 0, diverged: !!chain.node.chain[t.height] && chain.node.chain[t.height] !== t.hash }; post({ type: 'nostr', ...chain.nostr, live: true }); if (t.height > chain.node.height) setTimeout(() => enqueue(() => withSnapshot(() => sync(chain.blocksUrl, { noScripts }))), 3000); }, { nostr, log });
     }
   } finally { chain.syncing = false; }
 }
@@ -255,6 +266,7 @@ self.onmessage = (e) => enqueue(() => handle(e.data));
 async function handle(m) {
   try {
     if (m.type === 'sync') await withSnapshot(() => sync(m.blocksUrl, { noScripts: !!m.noScripts }));
+    else if (m.type === 'wake') { /* the page was asleep or offline: sockets may be half-dead, so open them again and look for blocks */ chain.tipSub?.reopen(); chain.mempoolSub?.reopen(); if (chain.node && chain.blocksUrl) await withSnapshot(() => sync(chain.blocksUrl, { noScripts: !!chain.noScripts })); }
     else if (m.type === 'close') { if (chain.timer) { clearInterval(chain.timer); chain.timer = null; } }
     else if (m.type === 'debug') await withSnapshot(async () => {
       const u = chain.utxo; const c = u?.get(m.key) ?? null; let cl = null, err = null;

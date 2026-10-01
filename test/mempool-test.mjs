@@ -55,4 +55,8 @@ t('a replacement paying more in total and per vB (BIP 125) takes the original\'s
 utxo.delete(`${coinA.txid}:0`); utxo.set(`${good.txid}:0`, { output: good.tx.outputs[0], height: 501, coinbase: false }); node.height = 501; mp.afterBlock();
 t('after the block that confirms the original, the replacement leaves the mempool and its inputs are released', !mp.txs.has(good.txid) && !mp.txs.has(better.txid) && mp.spent.size === 0 && mp.stats.dropped === 2);
 t('the wrong chain tag is ignored: an event for another chain never reaches validation', (() => { const before = mp.stats.seen; const ev = { kind: MEMPOOL_KIND, tags: [['chain', 'btc:mainnet']] }; return before === mp.stats.seen; })());
+// after a sleep the page asks for its sockets to be opened again: the subscription comes back on the same relay and keeps following
+sub.reopen(); await wait(400);
+const after = spend(coinB, 50000, other, 310); /* not the forged one's txid (a witness does not change it) */ pool = { [after.txid]: after.hex }; await pubr.tick(); await wait();
+t('reopened sockets (a page waking from sleep) keep following the relay', mp.txs.has(after.txid) && subs.size >= 1);
 pubr.close(); sub.close(); server.close(); console.log(`\n${ok} passed, ${bad} failed`); process.exit(bad ? 1 : 0);
