@@ -13,7 +13,7 @@ const WT_URL = 'https://cdn.jsdelivr.net/npm/webtorrent@3.0.21/dist/webtorrent.m
 // AbortSignal.timeout where the browser has it (Safari 15 has locks but not this)
 const timeoutSignal = (ms) => { if (AbortSignal.timeout) return AbortSignal.timeout(ms); const c = new AbortController(); setTimeout(() => c.abort(Object.assign(new Error('timed out'), { name: 'TimeoutError' })), ms); return c.signal; };
 // errors of the network, as opposed to a file or a rule: these are retried by themselves
-const NETWORK = /Failed to fetch|NetworkError|network|no data for|no answer in|block index \d|block file \d|short read|Load failed|aborted|timed? ?out|ECONN|503|502|504/i;
+const NETWORK = /Failed to fetch|NetworkError|network|no data for|no answer in|block index \d|block file \d|short read|short range|answered 5\d\d|Load failed|aborted|timed? ?out|ECONN|503|502|504/i;
 
 // a small worker holding one OPFS file with a sync access handle: the page's WebTorrent store writes pieces through it,
 // and a seeding page reads through it (read-only, so the node worker can read the same file)
@@ -27,6 +27,9 @@ onmessage = async (e) => { const m = e.data; try {
     if (fh.move) await fh.move(m.to); else { const out = await (await dir.getFileHandle(m.to, { create: true })).createSyncAccessHandle(); const src = await fh.createSyncAccessHandle(); const buf = new Uint8Array(32 << 20); let at = 0, n; while ((n = src.read(buf, { at })) > 0) { out.write(buf.subarray(0, n), { at }); at += n; } out.flush(); out.close(); src.close(); await dir.removeEntry(name); }
     postMessage({ id: m.id, ok: true }); }
   else if (m.t === 'remove') { if (h) { h.close(); h = null; } try { await (await root()).removeEntry(name); } catch {} postMessage({ id: m.id, ok: true }); }
+  else if (m.t === 'probe') { /* two read-only handles on one scratch file: only a browser with read-only access handles opens both (elsewhere the option is ignored and the first is exclusive) */ const dir = await root(); const fh = await dir.getFileHandle('.seed-probe', { create: true }); let a = null, b = null, ok = false;
+    try { a = await fh.createSyncAccessHandle({ mode: 'read-only' }); b = await fh.createSyncAccessHandle({ mode: 'read-only' }); ok = true; } catch {} finally { try { a?.close(); } catch {} try { b?.close(); } catch {} try { await dir.removeEntry('.seed-probe'); } catch {} }
+    postMessage({ id: m.id, ok: true, readOnly: ok }); }
 } catch (err) { postMessage({ id: m.id, ok: false, error: err.message }); } };`;
 function storeWorker() { const w = new Worker(URL.createObjectURL(new Blob([STORE_SRC], { type: 'text/javascript' }))); let id = 0; const waits = new Map();
   w.onmessage = (e) => { const m = e.data; const p = waits.get(m.id); if (!p) return; waits.delete(m.id); m.ok ? p.resolve(m) : p.reject(new Error(m.error)); };
@@ -75,7 +78,13 @@ export function createTabNode({ base, snapshotUrl, blocksUrl, torrent = false, s
   // ---- seeding: the complete, checked snapshot held read-only and served to the swarm while the tab is open
   let seeding = null;
   const fileReady = () => { const st = node.st; return !!st && st.dat >= st.expect.bytes && !!(st.sha || node.sha); };
-  async function seedStart() { if (seeding || !opts.seed || !fileReady() || swarm) return; const st = node.st; const sw = storeWorker(); seeding = { sw, client: null, t: null, base: node.sent, at: Date.now() }; const me = seeding;
+  // seeding holds the snapshot open read-only beside the node; a browser without read-only access handles would hold it
+  // exclusively and stop the node, so it is asked first (once) and seeding refused there
+  let seedProbe = null;
+  const seedSupported = () => (seedProbe ??= (async () => { const sw = storeWorker(); try { return !!(await sw.rpc({ t: 'probe' })).readOnly; } catch { return false; } finally { sw.terminate(); } })());
+  async function seedStart() { if (seeding || !opts.seed || !fileReady() || swarm) return;
+    if (!(await seedSupported())) { node.seedUnsupported = true; log('seeding is not possible in this browser: it cannot open the snapshot read-only beside the node (Chrome, Edge and Brave can)', 'err'); emit('seeding', { unsupported: true }); return; }
+    if (seeding || !opts.seed || !fileReady() || swarm) return; const st = node.st; const sw = storeWorker(); seeding = { sw, client: null, t: null, base: node.sent, at: Date.now() }; const me = seeding;
     const stop = (why) => { if (seeding !== me) return; log(`seeding stopped: ${why}`, 'err'); seedStop(); };
     try {
       const [{ default: WebTorrent }, tf] = await Promise.all([import(wtUrl), fetch(torrentFileUrl(snapshotUrl), { cache: 'no-store' }).then((r) => { if (!r.ok) throw new Error(`torrent file ${r.status}`); return r.arrayBuffer(); })]);
@@ -92,18 +101,24 @@ export function createTabNode({ base, snapshotUrl, blocksUrl, torrent = false, s
   // a network error by itself with a growing wait (5 s … 5 min)
   let retryTimer = null, retryN = 0;
   const retrySync = () => { clearTimeout(retryTimer); retryTimer = null; node.lastError = { text: node.error, at: Date.now() }; node.error = null; log('looking for the blocks again'); startSync(); };
-  let hiddenAt = null; const wake = () => { if (!worker) return; if (node.phase === 'fetch' && node.error && !swarm) { node.lastError = { text: node.error, at: Date.now() }; node.error = null; log('the connection is back: resuming the snapshot'); plainFetch(); } else if (node.phase === 'sync' && node.error && !node.synced) retrySync(); else if (node.synced) post({ type: 'wake' }); };
+  let hiddenAt = null; const wake = () => { if (!worker) return; if (node.phase === 'fetch' && node.error && !swarm) { clearTimeout(retryTimer); retryTimer = null; node.lastError = { text: node.error, at: Date.now() }; node.error = null; log('the connection is back: resuming the snapshot'); plainFetch(); } else if (node.phase === 'sync' && node.error && !node.synced) retrySync(); else if (node.synced) post({ type: 'wake' }); };
   globalThis.document?.addEventListener?.('visibilitychange', () => { if (document.visibilityState === 'hidden') hiddenAt = Date.now(); else { if (hiddenAt && Date.now() - hiddenAt > 60_000) wake(); hiddenAt = null; } });
   addEventListener('online', wake);
   // a laptop that slept with the tab in front fires neither of those: timers stop while asleep, so a long gap between ticks says it
   let lastTick = Date.now(); const ticker = setInterval(() => { const now = Date.now(); if (now - lastTick > 120_000) { log(`the computer slept for about ${Math.round((now - lastTick) / 60_000)} min: reconnecting`); wake(); } lastTick = now; }, 15_000); ticker.unref?.();
 
+  // a worker that died (memory pressure on a phone) or hangs says nothing: a ping every 30 s, answered outside its queue; two
+  // minutes without an answer is said as an error the page shows, and cleared when it answers again
+  let lastPong = Date.now(); const UNRESPONSIVE = 'the node has stopped answering (its worker may have been stopped by the browser): reload the page';
+  const pinger = setInterval(() => { if (!worker) return; post({ type: 'ping', t: Date.now() });
+    if (Date.now() - lastPong > 120_000 && !node.unresponsive) { node.unresponsive = true; node.error = UNRESPONSIVE; sync('Error: ' + UNRESPONSIVE, null); log(UNRESPONSIVE, 'err'); emit('unresponsive', {}); emit('message', { type: 'unresponsive' }); } }, 30_000); pinger.unref?.();
   // ---- the worker's messages: the loader takes the phases, the page gets every message after
   function onMessage(e) { const m = e.data;
+    if (m.type === 'pong') { lastPong = Date.now(); if (node.unresponsive) { node.unresponsive = false; if (node.error === UNRESPONSIVE) node.error = null; log('the node answers again'); } return; }
     if (m.type === 'status') { const first = !node.st; node.st = m; if (!first) seedStart(); if (first) { if (m.dat < m.expect.bytes) { if (opts.torrent) swarmFetch(m); else plainFetch(); } else if (!m.sha) hashPhase(); else if (m.idx <= 0) { seedStart(); verifyPhase(); } else { seedStart(); startSync(); } } }
     else if (m.type === 'fetch') { node.recv = m.have; sync(`Synchronizing with network… fetching the UTXO snapshot (${mib(m.have)} of ${mib(m.total)}, ${(m.rate / 1048576).toFixed(1)} MiB/s)`, m.have / m.total * 100, eta(m.have, m.total, node.fetchT0)); }
     else if (m.type === 'hashing') { sync(`Checking the snapshot's sha256… ${mib(m.at)} of ${mib(m.total)}`, m.at / m.total * 100, ''); }
-    else if (m.type === 'fetched') { if (m.ms) hist('fetch the snapshot', m.ms); hist('check the sha256', Math.max(0, performance.now() - node.fetchT0 - (m.ms || 0))); if (!m.ok) { node.error = 'the snapshot\'s sha256 does not match the pinned value'; sync('Snapshot hash MISMATCH: the file is not the one the node expects', null); } else { node.sha = m.sha256; if (node.st) node.st.sha = m.sha256; seedStart(); verifyPhase(); } }
+    else if (m.type === 'fetched') { retryN = 0; if (m.ms) hist('fetch the snapshot', m.ms); hist('check the sha256', Math.max(0, performance.now() - node.fetchT0 - (m.ms || 0))); if (!m.ok) { node.error = 'the snapshot\'s sha256 does not match the pinned value'; sync('Snapshot hash MISMATCH: the file is not the one the node expects', null); } else { node.sha = m.sha256; if (node.st) node.st.sha = m.sha256; seedStart(); verifyPhase(); } }
     else if (m.type === 'parsing') { sync(`Verifying the snapshot… ${m.text.trim()}`, null); }
     else if (m.type === 'verified') { hist('parse, hash and index the snapshot', m.ms); node.coins = m.coins; node.txids = m.txids; node.hs = m.hashSerialized; node.hsOk = m.ok; if (!m.ok) { node.error = 'hash_serialized_3 mismatch'; sync('Snapshot verification FAILED: hash_serialized_3 does not match', null); } else startSync(); }
     else if (m.type === 'blockfile') { node.recv += m.fetched || 0; }
@@ -112,6 +127,7 @@ export function createTabNode({ base, snapshotUrl, blocksUrl, torrent = false, s
     else if (m.type === 'nostr') { node.nostr = m; }
     else if (m.type === 'mempool') { node.mempool = m; }
     else if (m.type === 'error') { const lookup = node.synced && /Block not found|sync first|not in the set|not in mempool/.test(m.text); if (!lookup) { node.error = m.text; sync('Error: ' + m.text.slice(0, 140), null); }
+      if (!lookup && node.phase === 'fetch' && !swarm && NETWORK.test(m.text) && !retryTimer) { const wait = Math.min(300_000, 5000 * 2 ** retryN++); log(`the snapshot's source did not answer: the fetch resumes in ${Math.round(wait / 1000)} s`); retryTimer = setTimeout(() => { retryTimer = null; node.lastError = { text: node.error, at: Date.now() }; node.error = null; plainFetch(); }, wait); }
       if (!lookup && node.phase === 'sync' && !node.synced && NETWORK.test(m.text) && !retryTimer) { const wait = Math.min(300_000, 5000 * 2 ** retryN++); log(`the block source did not answer: trying again in ${Math.round(wait / 1000)} s`); retryTimer = setTimeout(retrySync, wait); } log((lookup ? '' : 'node error: ') + m.text.replace(/ @ .*$/, '') + (lookup ? ' (code -5)' : ''), 'err'); }
     else if (m.type === 'log') { log(m.text); }
     if (m.type !== 'log') emit(m.type, m); emit('message', m); } // 'log' is the loader's own event above, so a worker log line is not delivered twice
@@ -121,20 +137,27 @@ export function createTabNode({ base, snapshotUrl, blocksUrl, torrent = false, s
   // start({ force: true }) runs without the lock, for a browser whose lock API fails; the page asks the person first
   async function start({ force = false } = {}) { if (navigator.locks && opts.lock !== false && !force) { const got = await new Promise((res) => navigator.locks.request('bitcoin-blake:node', { signal: timeoutSignal(3000) }, () => { res(true); return new Promise(() => {}); }).catch((e) => { if (e?.name !== 'AbortError' && e?.name !== 'TimeoutError') node.lockError = e?.message || String(e); res(false); })); /* a reload of the same tab can find the lock still held by the page it replaces: wait up to three seconds */ if (!got && node.lockError) { node.phase = 'busy'; sync('the browser refused the lock that keeps one node per browser: ' + node.lockError, null); emit('busy', { error: node.lockError }); return false; } if (!got) { node.busy = true; node.phase = 'busy'; sync('idle: the node runs in another tab of this browser (Reef, Bight, Winch or Hitch)', null); emit('busy', {}); return false; } }
     return startWorker(); }
+  let workerSrc = null;
+  const spawn = () => { worker = new Worker(URL.createObjectURL(new Blob([workerSrc], { type: 'text/javascript' })), { type: 'module' }); worker.onmessage = onMessage; worker.onerror = (e) => { node.error = e.message || 'worker failed'; sync('Error: ' + node.error, null); log('worker error: ' + node.error, 'err'); }; lastPong = Date.now(); };
   async function startWorker() {
     // the node's code from the CDN: a hang or an error page would otherwise become a worker that never speaks, or a syntax error
     let src; try { const r = await fetch(`${base}/browser/worker.js`, { signal: timeoutSignal(30_000) }); if (!r.ok) throw new Error(`answered ${r.status}`); src = await r.text(); }
-    catch (e) { throw new Error(`the node's code could not be loaded from ${base.replace(/^https?:\/\//, '').split('/')[0]} (${e?.name === 'TimeoutError' || e?.name === 'AbortError' ? 'no answer in 30 s' : e.message}): check the connection and reload`); } const w = src.replace(/from '\.\.\/lib\//g, `from '${base}/lib/`).replace(/from '\.\/blocks\.js'/g, `from '${base}/browser/blocks.js'`);
-    worker = new Worker(URL.createObjectURL(new Blob([w], { type: 'text/javascript' })), { type: 'module' }); worker.onmessage = onMessage; worker.onerror = (e) => { node.error = e.message || 'worker failed'; sync('Error: ' + node.error, null); log('worker error: ' + node.error, 'err'); };
+    catch (e) { throw new Error(`the node's code could not be loaded from ${base.replace(/^https?:\/\//, '').split('/')[0]} (${e?.name === 'TimeoutError' || e?.name === 'AbortError' ? 'no answer in 30 s' : e.message}): check the connection and reload`); } workerSrc = src.replace(/from '\.\.\/lib\//g, `from '${base}/lib/`).replace(/from '\.\/blocks\.js'/g, `from '${base}/browser/blocks.js'`);
+    spawn();
     sync('Starting the node…', null); log('loading the node from ' + base.replace('https://cdn.jsdelivr.net/gh/', '')); post({ type: 'status' }); return true; }
 
   return { node, opts, on, emit, start, post, startSync, fileReady, seedStart, seedStop,
     get swarm() { return swarm; }, get seeding() { return seeding; },
     setTorrent(v) { opts.torrent = !!v; }, setSeed(v) { opts.seed = !!v; if (opts.seed) seedStart(); else seedStop(); },
     followMempool({ relays, also = [23503], seedUrl = blocksUrl.replace(/-blocks$/, '-mempool.json') }) { post({ type: 'mempool', relays, also, seedUrl }); },
-    // resolves once the worker has removed the node's files ({ removed, failed }); rejects if it does not answer in 20 s
-    wipe({ timeoutMs = 20_000 } = {}) { swarmTeardown(true); return seedStop().then(() => new Promise((resolve, reject) => { if (!worker) return reject(new Error('the node is not running in this tab'));
-      const off = on('wiped', (m) => { clearTimeout(t); off(); resolve({ removed: m.removed, failed: m.failed }); });
-      const t = setTimeout(() => { off(); reject(new Error('the node is busy and did not wipe in time: close other tabs of this site and try again')); }, timeoutMs);
-      post({ type: 'wipe' }); })); } };
+    // resolves once the node's files are removed ({ removed, failed }). A worker that does not answer in `timeoutMs` (busy, or
+    // stuck) is stopped and a fresh one wipes; that one has another `timeoutMs`, else this rejects and nothing is pending
+    wipe({ timeoutMs = 20_000 } = {}) { swarmTeardown(true);
+      const once = () => new Promise((resolve, reject) => { const off = on('wiped', (m) => { clearTimeout(t); off(); resolve({ removed: m.removed, failed: m.failed }); });
+        const t = setTimeout(() => { off(); reject(new Error('timeout')); }, timeoutMs); post({ type: 'wipe' }); });
+      return seedStop().then(async () => { if (!worker) throw new Error('the node is not running in this tab');
+        try { return await once(); }
+        catch { log('the node did not answer the wipe: stopping it and wiping from a fresh one', 'err'); try { worker.terminate(); } catch {} spawn();
+          try { return await once(); } catch { try { worker.terminate(); } catch {} worker = null; throw new Error('the node did not wipe in time, and nothing is pending: close the other tabs of this site and try again'); } } }); },
+    seedSupported };
 }

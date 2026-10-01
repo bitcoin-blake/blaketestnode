@@ -58,6 +58,21 @@ $('blocks').value = params.get('blocks') ?? localStorage.getItem('blocksUrl') ??
 const ago = (s) => s == null ? '' : s < 90 ? `${s} s ago` : s < 5400 ? `${Math.round(s/60)} min ago` : `${(s/3600).toFixed(1)} h ago`;
 const now = () => Math.floor(Date.now() / 1000);
 let st = null, busy = false;
+// one node per browser for this origin: Reef, Bight, Winch and Hitch share these files and this lock. Without it, this page
+// stays idle (a second worker on the same files would fight the first, and a wipe here would delete theirs)
+const lockState = await (async () => {
+  if (!navigator.locks) return 'no-locks';
+  const signal = AbortSignal.timeout ? AbortSignal.timeout(3000) : (() => { const c = new AbortController(); setTimeout(() => c.abort(), 3000); return c.signal; })();
+  return new Promise((res) => navigator.locks.request('bitcoin-blake:node', { signal }, () => { res('held'); return new Promise(() => {}); }).catch(() => res('busy')));
+})();
+if (lockState !== 'held') {
+  for (const b of document.querySelectorAll('button')) b.disabled = true;
+  document.querySelector('.sub').textContent = lockState === 'busy'
+    ? 'idle: the node of this site already runs in another tab (Reef, Bight, Winch or Hitch). Close it to use this page; nothing here touches its files.'
+    : 'this browser has no Web Locks, so this page cannot make sure it is the only node of this site: it does not start.';
+  document.querySelector('.sub').className = 'sub warn';
+  throw new Error('idle: ' + lockState);
+}
 const worker = new Worker('./worker.js', { type: 'module' });
 worker.onmessage = (e) => {
   const m = e.data;

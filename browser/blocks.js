@@ -10,8 +10,10 @@ export function deadline(ms, also = null) {
 }
 // a fetch whose body must keep moving: aborted when nothing arrives for `idleMs` (a blackholed connection never errors by
 // itself), or when `signal` aborts; resolves to { res, bytes } with the whole body read
-export async function fetchIdle(url, init = {}, { idleMs = 30_000, signal = null, onChunk = null } = {}) {
+// totalMs: a deadline for the whole body too (a connection that trickles a byte every 29 s would otherwise never end)
+export async function fetchIdle(url, init = {}, { idleMs = 30_000, totalMs = null, signal = null, onChunk = null } = {}) {
   const c = new AbortController(); let timer = null;
+  const whole = totalMs ? setTimeout(() => c.abort(new Error(`no answer in ${Math.round(totalMs / 1000)} s from ${String(url).replace(/^https?:\/\//, '').split('/')[0]}`)), totalMs) : null;
   const arm = () => { clearTimeout(timer); timer = setTimeout(() => c.abort(new Error(`no data for ${Math.round(idleMs / 1000)} s from ${String(url).replace(/^https?:\/\//, '').split('/')[0]}`)), idleMs); };
   if (signal) { if (signal.aborted) c.abort(signal.reason); else signal.addEventListener('abort', () => c.abort(signal.reason), { once: true }); }
   arm();
@@ -23,7 +25,7 @@ export async function fetchIdle(url, init = {}, { idleMs = 30_000, signal = null
     const bytes = new Uint8Array(n); let at = 0; for (const p of parts) { bytes.set(p, at); at += p.length; }
     return { res, bytes };
   } catch (e) { throw c.signal.aborted && c.signal.reason instanceof Error ? c.signal.reason : e; }
-  finally { clearTimeout(timer); }
+  finally { clearTimeout(timer); clearTimeout(whole); }
 }
 export class OpfsBlockSource {
   constructor(k, base, files, { log = () => {}, signal = () => null } = {}) { Object.assign(this, { k, base, files, log, signal }); }
@@ -46,7 +48,9 @@ export class OpfsBlockSource {
     const ir = await fetchIdle(`${this.base}.json`, { cache: 'no-cache' }, { signal: this.signal() });
     if (!ir.res.ok) throw new Error(`block index ${ir.res.status} (needs Range and CORS)`);
     const index = JSON.parse(new TextDecoder().decode(ir.bytes));
-    let localIndex = { blocks: [] }; try { localIndex = JSON.parse((await this.files.readText('blocks.json')) ?? '{"blocks":[]}'); } catch {}
+    const indexText = new TextDecoder().decode(ir.bytes);
+    const localText = await this.files.readText('blocks.json');
+    let localIndex = { blocks: [] }; try { localIndex = JSON.parse(localText ?? '{"blocks":[]}'); } catch {}
     let common = 0;
     while (common < localIndex.blocks.length && common < index.blocks.length && localIndex.blocks[common].hash === index.blocks[common].hash) common++;
     const have = common ? localIndex.blocks[common - 1].offset + HEADER + localIndex.blocks[common - 1].size : 0;
@@ -59,7 +63,8 @@ export class OpfsBlockSource {
       if (h.getSize() > have) h.truncate(have);
       if (want > have) {
         const t0 = performance.now();
-        const { res, bytes } = await fetchIdle(`${this.base}.dat`, { headers: { range: `bytes=${have}-${want - 1}` }, cache: 'no-store' }, { signal: this.signal() });
+        /* a whole-body deadline too: a minute, plus a second per 50 KB wanted (a slow link is slow, not stuck) */
+        const { res, bytes } = await fetchIdle(`${this.base}.dat`, { headers: { range: `bytes=${have}-${want - 1}` }, cache: 'no-store' }, { signal: this.signal(), totalMs: 60_000 + Math.ceil((want - have) / 50_000) * 1000 });
         if (res.status !== 206 && !(res.status === 200 && have === 0)) throw new Error(`block file ${res.status}`);
         if (bytes.length !== want - have) throw new Error(`short read ${bytes.length} of ${want - have}`);
         h.write(bytes, { at: have }); h.flush(); fetched = bytes.length;
@@ -78,7 +83,7 @@ export class OpfsBlockSource {
         prev = e;
       }
     } finally { try { h.close(); } catch {} }
-    await this.files.writeText('blocks.json', JSON.stringify(index));
+    if (localText !== indexText) await this.files.writeText('blocks.json', indexText); // unchanged: no write (less wear, no torn-write window)
     this.index = index; this.byHeight = new Map(index.blocks.map((b) => [b.height, b]));
     return { from: index.from, to: index.to, fetched, verified: index.blocks.length - common, blocks: index.blocks.length };
   }

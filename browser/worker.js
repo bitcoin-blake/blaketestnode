@@ -2,11 +2,11 @@
 // disk, hashes it, parses and indexes it with the same code the Node daemon runs.
 import { SNAPSHOT, CHAIN } from '../lib/params.mjs';
 import { Sha256 } from '../lib/sha256.mjs';
-import { buildIndex, indexBytes, parseIndexBytes } from '../lib/packed.mjs';
+import { buildIndexAsync, indexBytes, parseIndexBytes } from '../lib/packed.mjs';
 import { bytesToHex } from '../lib/bytes.mjs';
 import { PackedUtxo } from '../lib/packed.mjs';
 import { ChainNode } from '../lib/node.mjs';
-import { fetchTip, subscribeTip, judgeTip as judge } from '../lib/nip333.mjs';
+import { fetchTip, subscribeTip, judgeTip as judge, servedDisagreement, rollbackAllowed } from '../lib/nip333.mjs';
 import { buildTemplate, checkTemplate } from '../lib/template.mjs';
 import { makeWebMiner } from '../lib/webminer.mjs';
 const SIDESTR = 'https://cdn.jsdelivr.net/gh/sidestr/spec@cec654b7d06907130700fe52c66c3f9d0921495d/siding/lib';
@@ -14,11 +14,24 @@ import { Mempool, subscribeMempool } from '../lib/mempool.mjs';
 import { OpfsBlockSource, fetchIdle, deadline } from './blocks.js';
 
 const CDN = 'https://cdn.jsdelivr.net/gh/bitcoin-desktop/schema@b8cbf6337c7450fe14ddc5bce00c7280059aab5d'; // v0.0.27, pinned by commit: a tag can move
+// sha256 of each rule file at the pinned engine commit (test/rules-test.mjs checks them against the engine's repository)
+const RULES_SHA256 = {
+  'schema/core.jsonld': 'fb5f3e2b984bfaa36eee6d5e6a6a191c3865cc09cadb4ffee16fae76a54e6ef5',
+  'schema/proof.jsonld': '0defcdc32d7421d1440628681027564a7e5590f62d351cc5f075b6cd57c4d1e0',
+  'schema/script.jsonld': 'c3a28b41ceae1c1f83288fe1755d1550989e5c5a3e51f1bf8c729a6e42db73a8',
+  'schema/chain.jsonld': 'ccbdb40f9ffd72c0686c6303ab8899f79f6c651735bdfcef431af6c23efec821',
+  'schema/validate.jsonld': '4eb6792d4330397631d14dc4a8734ddb28fdd2459a3f98fc2bf822596a95bfb0',
+  'schema/overlays/knots-blake2b.jsonld': 'b5b76b03a8b1159b4dd304a9b3b65b9a5891204f81fa0b26e4b42692d0a2022e',
+};
+// the layout of the node's files in this origin's storage: a newer node that changes a format raises it, and an older node
+// refuses files of a newer layout rather than misread them
+const LAYOUT = 1;
 let engine = null;
 async function loadEngine() {
   if (engine) return engine;
   const [{ createKernel }, { knotsBlake2b }, nostr, hash] = await Promise.all([import(`${CDN}/codec/kernel.js`), import(`${CDN}/codec/overlays/knots-blake2b.js`), import(`${CDN}/codec/nostr.js`), import(`${CDN}/codec/hash.js`)]);
-  const j = async (p) => { const r = await fetch(`${CDN}/${p}`, { signal: deadline(30_000) }); if (!r.ok) throw new Error(`the engine's ${p}: ${r.status} from cdn.jsdelivr.net`); return r.json(); };
+  /* the rule files by content as well as by commit: a CDN serving other rules would validate another chain */
+  const j = async (p) => { const r = await fetch(`${CDN}/${p}`, { signal: deadline(30_000) }); if (!r.ok) throw new Error(`the engine's ${p}: ${r.status} from cdn.jsdelivr.net`); const b = new Uint8Array(await r.arrayBuffer()); const got = bytesToHex(new Uint8Array(await crypto.subtle.digest('SHA-256', b))); if (got !== RULES_SHA256[p]) throw new Error(`the engine's ${p} from cdn.jsdelivr.net is not the pinned file (sha256 ${got.slice(0, 12)}…); the node will not validate with it`); return JSON.parse(new TextDecoder().decode(b)); };
   const k = createKernel({ core: await j('schema/core.jsonld'), proof: await j('schema/proof.jsonld'), script: await j('schema/script.jsonld'), chain: await j('schema/chain.jsonld'), validate: await j('schema/validate.jsonld'), network: CHAIN.network, overlays: [knotsBlake2b(await j('schema/overlays/knots-blake2b.jsonld'))] });
   return (engine = { k, nostr, hash });
 }
@@ -56,6 +69,15 @@ async function status() {
   const est = await navigator.storage.estimate().catch(() => ({}));
   const dat = await sizeOf(SNAPSHOT.file), idx = await sizeOf(`${SNAPSHOT.file}.idx`), sha = await readSmall(`${SNAPSHOT.file}.sha256`), partial = (await readSmall(`${SNAPSHOT.file}.ranges`)) != null;
   post({ type: 'status', quota: est.quota ?? null, usage: est.usage ?? null, dat: partial ? Math.min(dat, SNAPSHOT.bytes - 1) : dat, idx, sha, partial, expect: { file: SNAPSHOT.file, bytes: SNAPSHOT.bytes, sha256: SNAPSHOT.sha256, txoutsetHash: SNAPSHOT.txoutsetHash, baseHeight: SNAPSHOT.baseHeight, baseHash: SNAPSHOT.baseHash, coins: SNAPSHOT.coins, alias: CHAIN.alias } });
+}
+// move `from` over `to` (OPFS move where the browser has it, else a copy), so `to` is never seen half-written
+async function replaceFile(from, to) {
+  const d = await dir(); const fh = await d.getFileHandle(from);
+  try { await d.removeEntry(to); } catch {}
+  if (fh.move) { await fh.move(to); return; }
+  const src = await open(from); const out = await open(to, true); const buf = new Uint8Array(32 << 20); let at = 0, n;
+  try { out.truncate(0); while ((n = src.read(buf, { at })) > 0) { out.write(buf.subarray(0, n), { at }); at += n; } out.flush(); } finally { src.close(); out.close(); }
+  await d.removeEntry(from);
 }
 async function readSmall(name) { try { const h = await open(name); const b = new Uint8Array(h.getSize()); h.read(b, { at: 0 }); h.close(); return new TextDecoder().decode(b); } catch { return null; } }
 async function writeSmall(name, text) { const h = await open(name, true); h.truncate(0); h.write(new TextEncoder().encode(text), { at: 0 }); h.flush(); h.close(); }
@@ -120,10 +142,12 @@ async function fetchSnapshot(url, { parallel = 6, chunk = 32 << 20 } = {}) {
   try { await (await dir()).removeEntry(journalName); } catch {}
 }
 
+// long CPU work gives way now and then: a wipe or a ping is answered, and a wipe stops it
+const pause = async () => { await new Promise((r) => setTimeout(r, 0)); if (chain.cpuAbort) throw chain.cpuAbort; };
 async function hashFile() { // for a file that landed in an earlier session without a recorded hash
   const h = await open(SNAPSHOT.file); const sha = new Sha256(); const buf = new Uint8Array(8 << 20); const size = h.getSize();
-  for (let off = 0; off < size; off += buf.length) { const n = h.read(buf, { at: off }); sha.update(buf.subarray(0, n)); if ((off / buf.length) % 16 === 0) post({ type: 'hashing', at: off, total: size }); }
-  h.close(); const hex = bytesToHex(sha.digest()); await writeSmall(`${SNAPSHOT.file}.sha256`, hex); return hex;
+  try { for (let off = 0; off < size; off += buf.length) { const n = h.read(buf, { at: off }); sha.update(buf.subarray(0, n)); if ((off / buf.length) % 16 === 0) post({ type: 'hashing', at: off, total: size }); await pause(); } }
+  finally { h.close(); } const hex = bytesToHex(sha.digest()); await writeSmall(`${SNAPSHOT.file}.sha256`, hex); return hex;
 }
 
 // Parse, verify hash_serialized_3, build the index, keep it on disk.
@@ -131,10 +155,9 @@ async function verify() {
   const h = await open(SNAPSHOT.file);
   const source = new OpfsBytes(h);
   const t0 = performance.now();
-  const r = buildIndex(source, { hash: true, log: (text) => post({ type: 'parsing', text }) });
-  h.close();
+  let r; try { r = await buildIndexAsync(source, { hash: true, log: (text) => post({ type: 'parsing', text }), pause }); } finally { h.close(); }
   const ok = r.hashSerialized === SNAPSHOT.txoutsetHash && r.baseHash === SNAPSHOT.baseHash && r.coinsRead === SNAPSHOT.coins && r.networkMagic === CHAIN.networkMagic;
-  if (ok) { const ih = await open(`${SNAPSHOT.file}.idx`, true); ih.truncate(0); ih.write(indexBytes({ entries: r.entries, count: r.count, baseHash: r.baseHash }, SNAPSHOT.sha256), { at: 0 }); ih.flush(); ih.close(); }
+  if (ok) { /* written beside, then moved into place: a tab closed mid-write leaves a .tmp, never a torn index */ const tmp = `${SNAPSHOT.file}.idx.tmp`; const ih = await open(tmp, true); ih.truncate(0); ih.write(indexBytes({ entries: r.entries, count: r.count, baseHash: r.baseHash }, SNAPSHOT.sha256), { at: 0 }); ih.flush(); ih.close(); await replaceFile(tmp, `${SNAPSHOT.file}.idx`); }
   post({ type: 'verified', ok, coins: r.coinsRead, txids: r.txids, baseHash: r.baseHash, hashSerialized: r.hashSerialized, networkMagic: r.networkMagic, ms: performance.now() - t0, indexBytes: r.entries.length });
 }
 
@@ -145,7 +168,8 @@ async function wipe() {
   try { for await (const [name] of d.entries()) names.push(name); } catch { names = [SNAPSHOT.file, `${SNAPSHOT.file}.idx`, `${SNAPSHOT.file}.sha256`, `${SNAPSHOT.file}.ranges`, `${SNAPSHOT.file}.part`, 'blocks.dat', 'blocks.json', 'deltas.json', 'context-headers.json', `context-headers-${SNAPSHOT.baseHeight}.json`]; }
   const removed = [], failed = [];
   for (const n of names) { try { await d.removeEntry(n, { recursive: true }); removed.push(n); } catch (e) { if (e?.name !== 'NotFoundError') failed.push(`${n}: ${e.message}`); } }
-  Object.assign(chain, { node: null, utxo: null, source: null, bytes: null, deltas: [] });
+  layoutChecked = false;
+  Object.assign(chain, { node: null, utxo: null, source: null, bytes: null, deltas: [], cpuAbort: null });
   post({ type: 'wiped', removed, failed });
 }
 
@@ -186,8 +210,9 @@ function foundNonce({ jobKey, nonce, nonce2 = 0 }) {
 }
 async function loadSet() {
   if (chain.utxo) return chain.utxo;
-  const ih = await open(`${SNAPSHOT.file}.idx`); const ib = new Uint8Array(ih.getSize()); ih.read(ib, { at: 0 }); ih.close();
-  const index = parseIndexBytes(ib, SNAPSHOT.sha256);
+  const readIdx = async () => { const ih = await open(`${SNAPSHOT.file}.idx`); const ib = new Uint8Array(ih.getSize()); ih.read(ib, { at: 0 }); ih.close(); return parseIndexBytes(ib, SNAPSHOT.sha256); };
+  let index; try { index = await readIdx(); }
+  catch (e) { /* torn or foreign: removed, rebuilt from the snapshot (which is checked again on the way), then read */ log(`the snapshot's index could not be used (${e.message}): building it again`); try { await (await dir()).removeEntry(`${SNAPSHOT.file}.idx`); } catch {} await verify(); index = await readIdx(); }
   chain.bytes = new OpfsBytes(null);
   chain.utxo = new PackedUtxo(chain.bytes, index);
   return chain.utxo;
@@ -204,8 +229,16 @@ async function withSnapshot(fn) {
 function judgeTip() {
   const t = chain.tipHeaders; if (!t || !chain.node) return;
   const { agree, diverged } = judge(t, { applied: (h) => chain.node.chain[h], served: (h) => chain.source?.byHeight?.get(h)?.hash });
-  const prev = chain.nostr; const next = { height: t.height, hash: t.hash, relay: t.relay, created_at: t.created_at, live: !!t.live, agree, diverged };
+  const prev = chain.nostr; const next = { height: t.height, hash: t.hash, relay: t.relay, created_at: t.created_at, live: !!t.live, agree, diverged, aboveTip: chain.node.height - t.height };
   if (!prev || prev.agree !== agree || prev.diverged !== diverged || prev.height !== next.height || prev.hash !== next.hash || prev.live !== next.live) { chain.nostr = next; post({ type: 'nostr', ...next }); }
+}
+// the served chain against the last signed headers this tab holds, before any rollback or apply: a block file that differs
+// from what the signed tip says is refused outright (neither rolled back to nor applied), not applied and flagged after
+async function servedAgainstTip() {
+  const t = chain.tipHeaders; if (!t?.hashes?.length || !chain.source) return;
+  const h = await servedDisagreement(t, (x) => chain.source.hash(x));
+  if (h != null) { chain.nostr = { height: t.height, hash: t.hash, relay: t.relay, created_at: t.created_at, live: !!t.live, agree: 0, diverged: true }; post({ type: 'nostr', ...chain.nostr });
+    throw new Error(`block file disagrees with the NIP-333 headers at ${h}: nothing is applied or rolled back until they agree`); }
 }
 const tipFrom = (t, k, live) => ({ height: t.height, hash: t.hash, relay: t.relay, created_at: t.created_at, live, first: t.first, hashes: (t.headers ?? []).map((x) => k.codec.blockHash(x)) });
 async function sync(blocksUrl, { noScripts = false } = {}) {
@@ -219,6 +252,7 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     chain.source ??= new OpfsBlockSource(k, blocksUrl, files, { log, signal: () => chain.syncAbort?.signal ?? null });
     const u = await chain.source.update();
     post({ type: 'blockfile', ...u });
+    await servedAgainstTip();
     const epochStart = Math.floor(SNAPSHOT.baseHeight / CHAIN.retargetInterval) * CHAIN.retargetInterval;
     if (!chain.node) {
       const ctx = await chain.source.contextHeaders(blocksUrl.replace(/-blocks$/, '-context-headers.json'), { from: epochStart, to: SNAPSHOT.baseHeight });
@@ -248,6 +282,8 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     // rollback if the served chain diverged from what we applied
     let common = chain.node.height;
     while (common > SNAPSHOT.baseHeight && (await chain.source.hash(common)) !== chain.node.chain[common]) common--;
+    // a rollback that would replace blocks below the first one the signed headers cover is refused: nothing signed says it
+    if (common < chain.node.height && !rollbackAllowed(common, chain.tipHeaders)) throw new Error(`the block file replaces blocks from ${common + 1}, below the signed chain tip's headers (from ${chain.tipHeaders.first}): refused until a signed tip covers it`);
     if (common < chain.node.height) { log(`reorg: rolling back ${chain.node.height - common} block(s)`); chain.node.rollbackTo(common); chain.deltas = chain.deltas.filter((d) => d.height <= common); await writeSmall('deltas.json', JSON.stringify(chain.deltas)); judgeTip(); }
     const to = await chain.source.tip();
     let applied = 0, txs = 0;
@@ -262,11 +298,11 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     if (applied) chain.mempool?.afterBlock();
     judgeTip();
     if (applied && chain.miner) { if (chain.solo) soloWork(`tip ${chain.node.height}`); else newWork(`tip ${chain.node.height}`); }
-    post({ type: 'synced', height: chain.node.height, hash: chain.node.tipHash(), time: chain.node.headers[chain.node.height]?.time ?? null, coins: utxo.size, applied, txs, ms: performance.now() - t0, stats: chain.node.stats, scripts: !noScripts, quiet: applied === 0 && !!chain.timer });
+    post({ type: 'synced', aboveTip: chain.tipHeaders ? chain.node.height - chain.tipHeaders.height : null, height: chain.node.height, hash: chain.node.tipHash(), time: chain.node.headers[chain.node.height]?.time ?? null, coins: utxo.size, applied, txs, ms: performance.now() - t0, stats: chain.node.stats, scripts: !noScripts, quiet: applied === 0 && !!chain.timer });
     if (!chain.timer) {
-      chain.timer = setInterval(() => enqueue(() => withSnapshot(() => sync(chain.blocksUrl, { noScripts }))), 30_000);
+      chain.timer = setInterval(() => queueSync(), 30_000);
       chain.noScripts = noScripts;
-      chain.tipSub = await subscribeTip(k, CHAIN.nip333, (t) => { chain.tipAt = Date.now(); if (chain.tipHeaders && t.height < chain.tipHeaders.height) return; /* an older event replayed by a relay says nothing new */ chain.tipHeaders = tipFrom(t, k, true); judgeTip(); if (t.height > chain.node.height) setTimeout(() => enqueue(() => withSnapshot(() => sync(chain.blocksUrl, { noScripts }))), 3000); }, { nostr, log });
+      chain.tipSub = await subscribeTip(k, CHAIN.nip333, (t) => { chain.tipAt = Date.now(); if (chain.tipHeaders && t.height < chain.tipHeaders.height) return; /* an older event replayed by a relay says nothing new */ chain.tipHeaders = tipFrom(t, k, true); judgeTip(); if (t.height > chain.node.height) setTimeout(() => queueSync(), 3000); }, { nostr, log });
     }
   } finally { chain.syncing = false; chain.syncAbort = null; }
 }
@@ -274,7 +310,7 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
 let mpTimer = null; const watch = { scripts: new Set(), outpoints: new Set() }; // a wallet's scripts and coins: their transactions are always sent, past the first 1,000
 function postMempool(now = false) { if (!chain.mempool) return; if (mpTimer && !now) return; if (mpTimer) clearTimeout(mpTimer);
   mpTimer = setTimeout(() => { mpTimer = null; const mp = chain.mempool; const list = mp.list(); const keyOf = (p) => `${p.txid}:${p.vout}`;
-    post({ type: 'mempool', height: chain.node?.height ?? null, count: list.length, bytes: list.reduce((a, e) => a + e.vsize, 0), fees: list.reduce((a, e) => a + e.fee, 0), stats: mp.stats, txs: list.filter((e, i) => i < 1000 || e.tx.outputs.some((o) => watch.scripts.has(o.scriptPubKey)) || e.tx.inputs.some((x) => watch.outpoints.has(keyOf(x.prevout)))).map((e) => ({ txid: e.txid, fee: e.fee, vsize: e.vsize, feeRate: e.feeRate, at: e.at, inputs: e.tx.inputs.map((i) => keyOf(i.prevout)), outputs: e.tx.outputs.map((o) => ({ value: o.value, scriptPubKey: o.scriptPubKey })) })) }); }, now ? 0 : 200); }
+    post({ type: 'mempool', height: chain.node?.height ?? null, count: list.length, bytes: list.reduce((a, e) => a + e.vsize, 0), fees: list.reduce((a, e) => a + e.fee, 0), stats: mp.stats, txs: list.filter((e, i) => i < 1000 || e.tx.outputs.some((o) => watch.scripts.has(o.scriptPubKey)) || e.tx.inputs.some((x) => watch.outpoints.has(keyOf(x.prevout)))).map((e) => ({ txid: e.txid, fee: e.fee, vsize: e.vsize, feeRate: e.feeRate, at: e.at, inputs: e.tx.inputs.map((i) => keyOf(i.prevout)), outputs: e.tx.outputs.map((o) => ({ value: o.value, scriptPubKey: o.scriptPubKey })), via: e.via ?? '', fed: !!e.fed })), lastFeedAt: mp.lastFeedAt ?? null, following: !!chain.mempoolSub }); }, now ? 0 : 200); }
 async function coin(key) {
   const { k } = await loadEngine(); const utxo = await loadSet();
   const c = utxo.get(key);
@@ -283,6 +319,11 @@ async function coin(key) {
   post({ type: 'coin', key, found: true, value: c.output.value, height: c.height, coinbase: c.coinbase, scriptType: cl.type, address: cl.address, scriptPubKey: c.output.scriptPubKey });
 }
 
+// a sync from the timer or a tip is queued only when none is queued or running already: on a slow link they would pile up
+// and keep the wallet's lookups waiting behind them
+function queueSync() { if (chain.syncing || chain.syncQueued || !chain.blocksUrl) return; chain.syncQueued = true; enqueue(() => { chain.syncQueued = false; return withSnapshot(() => sync(chain.blocksUrl, { noScripts: !!chain.noScripts })); }); }
+// a lookup reads only blocks this node applied (the served file can be ahead of, or on another branch than, what was validated)
+const applied = (h) => { const e = chain.source?.byHeight?.get(h); return e && chain.node && e.hash === chain.node.chain[h] ? e : null; };
 // one job at a time: every job opens OPFS handles, and two jobs interleaving at an await
 // would try to open the same file twice
 let queue = Promise.resolve();
@@ -291,11 +332,21 @@ const enqueue = (fn) => (queue = queue.then(fn).catch((err) => (err?.quiet ? log
 // wipe stops the timer, the fetches and the subscriptions first. Errors of an abort asked for here are not the node's errors.
 const quiet = (text) => Object.assign(new Error(text), { quiet: true });
 self.onmessage = (e) => { const m = e.data;
+  if (m.type === 'ping') return post({ type: 'pong', t: m.t ?? null }); /* answered at once, outside the queue: the page's proof that the node is alive */
   if (m.type === 'wake') { chain.tipSub?.reopen(); chain.mempoolSub?.reopen(); if (chain.syncing) chain.syncAbort?.abort(quiet('the page woke: a fresh sync replaces the one in flight')); }
-  else if (m.type === 'wipe') { if (chain.timer) { clearInterval(chain.timer); chain.timer = null; } chain.syncAbort?.abort(quiet('wiping')); chain.fetchAbort.abort(quiet('wiping')); try { chain.tipSub?.close(); chain.mempoolSub?.close(); chain.miner?.close?.(); } catch {} chain.tipSub = chain.mempoolSub = chain.miner = null; }
+  else if (m.type === 'wipe') { if (chain.timer) { clearInterval(chain.timer); chain.timer = null; } chain.syncAbort?.abort(quiet('wiping')); chain.fetchAbort.abort(quiet('wiping')); chain.cpuAbort = quiet('wiping'); try { chain.tipSub?.close(); chain.mempoolSub?.close(); chain.miner?.close?.(); } catch {} chain.tipSub = chain.mempoolSub = chain.miner = null; }
   enqueue(() => handle(m)); };
+// the files' layout, read once: absent is written as this node's; newer stops everything but a wipe
+let layoutChecked = false;
+async function checkLayout() {
+  if (layoutChecked) return; let j = null; try { j = JSON.parse((await readSmall('layout.json')) ?? 'null'); } catch {}
+  if (j && Number(j.layout) > LAYOUT) throw new Error(`this site's node files were written by a newer node (layout ${j.layout}, this one reads ${LAYOUT}): reload the page to get the newer node, or wipe the snapshot`);
+  if (!j || Number(j.layout) !== LAYOUT) await writeSmall('layout.json', JSON.stringify({ layout: LAYOUT }));
+  layoutChecked = true;
+}
 async function handle(m) {
   try {
+    if (m.type !== 'wipe' && m.type !== 'close') await checkLayout();
     if (m.type === 'sync') await withSnapshot(() => sync(m.blocksUrl, { noScripts: !!m.noScripts }));
     else if (m.type === 'wake') { /* the page was asleep or offline: sockets were reopened on arrival; look for blocks */ if (chain.node && chain.blocksUrl) await withSnapshot(() => sync(chain.blocksUrl, { noScripts: !!chain.noScripts })); }
     else if (m.type === 'close') { if (chain.timer) { clearInterval(chain.timer); chain.timer = null; } }
@@ -306,7 +357,7 @@ async function handle(m) {
     });
     else if (m.type === 'block') await withSnapshot(async () => { // a block from the mirrored file, by height or hash (a page's getblock)
       const { k } = await loadEngine(); if (!chain.source?.byHeight) throw new Error('sync first');
-      const height = m.hash ? [...chain.source.byHeight.values()].find((e) => e.hash === String(m.hash).toLowerCase())?.height : Number(m.height); const e = height != null && !Number.isNaN(height) ? chain.source.byHeight.get(height) : null; if (!e) throw new Error('Block not found');
+      const height = m.hash ? [...chain.source.byHeight.values()].find((e) => e.hash === String(m.hash).toLowerCase())?.height : Number(m.height); const e = height != null && !Number.isNaN(height) ? applied(height) : null; if (!e) throw new Error('Block not found');
       const block = k.codec.decode('Block', await chain.source.blockHex(height)); const txids = block.transactions.map((tx) => k.codec.txid(tx));
       post({ type: 'block', height, hash: e.hash, size: e.size, header: block.header, nTx: txids.length, txids, previousblockhash: block.header.prevBlockHash, nextblockhash: chain.source.byHeight.get(height + 1)?.hash ?? null, confirmations: chain.node ? chain.node.height - height + 1 : null, req: m.req ?? null }); });
     else if (m.type === 'watch') { watch.scripts = new Set(m.scripts ?? []); watch.outpoints = new Set(m.outpoints ?? []); postMempool(true); }
@@ -316,25 +367,27 @@ async function handle(m) {
       // the prevouts each coin's transaction spent, so a wallet can tell its own change from a receipt
       const { k } = await loadEngine(); const blocks = new Map();
       for (const c of out) { if (c.coinbase) continue; const txid = c.key.slice(0, c.key.indexOf(':'));
-        if (!blocks.has(c.height)) blocks.set(c.height, chain.source?.byHeight?.get(c.height) ? k.codec.decode('Block', await chain.source.blockHex(c.height)).transactions : []);
+        if (!blocks.has(c.height)) blocks.set(c.height, applied(c.height) ? k.codec.decode('Block', await chain.source.blockHex(c.height)).transactions : []);
         const tx = blocks.get(c.height).find((t) => k.codec.txid(t) === txid); if (tx) c.inputs = tx.inputs.map((i) => `${i.prevout.txid}:${i.prevout.vout}`); }
       post({ type: 'coins', script: want, height: chain.node?.height ?? null, coins: out, note: 'coins from before the snapshot are not scanned (the index is by txid)' }); });
     else if (m.type === 'coin') await withSnapshot(() => coin(m.key));
     else if (m.type === 'spend') await withSnapshot(async () => { // the transaction that spent an outpoint, looked for in the blocks from `from` to the tip (a channel watching its funding output)
       const { k } = await loadEngine(); if (!chain.source?.byHeight || !chain.node) throw new Error('sync first'); const want = String(m.key).toLowerCase(); const [txid, vout] = [want.slice(0, 64), Number(want.slice(65))];
-      for (let h = Math.max(Number(m.from) || (chain.node.height - 50), SNAPSHOT.baseHeight + 1); h <= chain.node.height; h++) { const e = chain.source.byHeight.get(h); if (!e) continue; const block = k.codec.decode('Block', await chain.source.blockHex(h));
-        for (const tx of block.transactions) if (tx.inputs.some((i) => i.prevout.txid === txid && i.prevout.vout === vout)) return post({ type: 'spend', key: want, found: true, height: h, blockHash: e.hash, txid: k.codec.txid(tx), hex: k.codec.encodeHex('Transaction', tx), req: m.req ?? null }); }
-      post({ type: 'spend', key: want, found: false, to: chain.node.height, req: m.req ?? null }); });
+      /* `to`: the last height searched without a gap; a block missing or not applied stops it there, so "not found" up to `to` is all it proves */
+      let to = null;
+      for (let h = Math.max(Number(m.from) || (chain.node.height - 50), SNAPSHOT.baseHeight + 1); h <= chain.node.height; h++) { const e = applied(h); if (!e) break; const block = k.codec.decode('Block', await chain.source.blockHex(h));
+        for (const tx of block.transactions) if (tx.inputs.some((i) => i.prevout.txid === txid && i.prevout.vout === vout)) return post({ type: 'spend', key: want, found: true, height: h, blockHash: e.hash, txid: k.codec.txid(tx), hex: k.codec.encodeHex('Transaction', tx), req: m.req ?? null }); to = h; }
+      post({ type: 'spend', key: want, found: false, to: to ?? (Number(m.from) || chain.node.height) - 1, req: m.req ?? null }); });
     else if (m.type === 'tx') await withSnapshot(async () => { // a transaction by txid in a given block
-      const { k } = await loadEngine(); const e = chain.source?.byHeight?.get(Number(m.height)); if (!e) throw new Error('Block not found'); const block = k.codec.decode('Block', await chain.source.blockHex(Number(m.height))); const tx = block.transactions.find((t) => k.codec.txid(t) === String(m.txid).toLowerCase());
+      const { k } = await loadEngine(); const e = applied(Number(m.height)); if (!e) throw new Error('Block not found'); const block = k.codec.decode('Block', await chain.source.blockHex(Number(m.height))); const tx = block.transactions.find((t) => k.codec.txid(t) === String(m.txid).toLowerCase());
       post({ type: 'tx', txid: m.txid, height: Number(m.height), found: !!tx, hex: tx ? k.codec.encodeHex('Transaction', tx) : null, req: m.req ?? null }); });
     else if (m.type === 'mempool') { // datstr SPEC 6.3: transactions from relays, validated here; a seed file from the mirror fills it on start
       const { k, nostr } = await loadEngine(); if (!chain.node) throw new Error('sync first'); if (chain.mempoolSub) chain.mempoolSub.close();
       const mp = new Mempool({ k, node: chain.node, network: CHAIN.network, log, onChange: () => postMempool(), onRefuse: (r, tx) => { if (tx && (tx.inputs.some((i) => watch.outpoints.has(`${i.prevout.txid}:${i.prevout.vout}`)) || tx.outputs.some((o) => watch.scripts.has(o.scriptPubKey)))) post({ type: 'refused', txid: r.txid, error: r.error, hex: r.hex }); /* the exact bytes: a copy with a broken signature has the same txid */ } }); chain.mempool = mp;
       // a check reads the UTXO set, which needs the snapshot attached: adds from the relays are queued as jobs like everything else
-      const rawAdd = mp.add.bind(mp); mp.add = (hex, from) => { enqueue(() => withSnapshot(() => { rawAdd(hex, from); })); return { ok: true, queued: true }; };
+      const rawAdd = mp.add.bind(mp); mp.add = (hex, from, via) => { if (via === 'feed') mp.lastFeedAt = Date.now(); enqueue(() => withSnapshot(() => { rawAdd(hex, from, via); })); return { ok: true, queued: true }; };
       chain.mempoolSub = await subscribeMempool(mp, { relays: m.relays, network: CHAIN.network, nostr, also: m.also ?? [], log });
-      if (m.seedUrl) { try { const { res: r, bytes } = await fetchIdle(m.seedUrl, { cache: 'no-store' }); if (r.ok) { const j = JSON.parse(new TextDecoder().decode(bytes)); let n = 0; await withSnapshot(() => { for (const t of j.txs ?? []) { if (rawAdd(t.hex, 'the mirror').ok) n++; } }); log(`mempool: ${n} of ${(j.txs ?? []).length} from the mirror's file at height ${j.height}`); } } catch (e) { log(`mempool: seed file: ${e.message}`); } }
+      if (m.seedUrl) { try { const { res: r, bytes } = await fetchIdle(m.seedUrl, { cache: 'no-store' }); if (r.ok) { const j = JSON.parse(new TextDecoder().decode(bytes)); let n = 0; await withSnapshot(() => { for (const t of j.txs ?? []) { if (rawAdd(t.hex, 'the mirror', 'seed').ok) n++; } }); log(`mempool: ${n} of ${(j.txs ?? []).length} from the mirror's file at height ${j.height}`); } } catch (e) { log(`mempool: seed file: ${e.message}`); } }
       postMempool(true); }
     else if (m.type === 'mempool-list') postMempool(true);
     else if (m.type === 'mine') await withSnapshot(() => startMining(m));
