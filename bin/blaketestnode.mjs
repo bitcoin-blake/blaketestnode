@@ -289,7 +289,7 @@ async function run() {
   setInterval(() => tick('poll'), POLL * 1000);
   const t0 = performance.now(); const nip = await fetchTip(k, CHAIN.nip333);
   if (nip) { st.nostr = { height: nip.height, hash: nip.hash, relay: nip.relay, created_at: nip.created_at, agree: node.chain[nip.height] ? node.chain[nip.height] === nip.hash : null }; log(`nostr tip ${nip.height} ${nip.hash.slice(0, 16)}… (${Math.round(performance.now() - t0)} ms)`); }
-  subscribeTip(k, CHAIN.nip333, (t) => { st.nostr = { ...t, agree: node.chain[t.height] ? node.chain[t.height] === t.hash : null }; log(`nostr: tip ${t.height} ${t.hash.slice(0, 16)}… via ${t.relay}`); if (t.height > node.height) setTimeout(() => tick('nostr'), 3000); }, { log });
+  subscribeTip(k, CHAIN.nip333, ({ headers: _h, first: _f, ...t }) => { /* the headers the event carries are the browser's to judge; the daemon keeps its status as it was */ st.nostr = { ...t, agree: node.chain[t.height] ? node.chain[t.height] === t.hash : null }; log(`nostr: tip ${t.height} ${t.hash.slice(0, 16)}… via ${t.relay}`); if (t.height > node.height) setTimeout(() => tick('nostr'), 3000); }, { log });
   const stop = async (sig) => { log(`${sig}: state is in the delta log (${deltas.length} blocks above checkpoint ${st.checkpoint?.height ?? base.height}), exiting`); process.exit(0); };
   process.on('SIGINT', () => stop('SIGINT')); process.on('SIGTERM', () => stop('SIGTERM'));
   log(`running: height ${node.height}, ${utxo.size.toLocaleString()} coins, polling every ${POLL} s, checkpoint every ${CKPT} blocks`);

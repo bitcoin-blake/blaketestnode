@@ -6,19 +6,19 @@ import { buildIndex, indexBytes, parseIndexBytes } from '../lib/packed.mjs';
 import { bytesToHex } from '../lib/bytes.mjs';
 import { PackedUtxo } from '../lib/packed.mjs';
 import { ChainNode } from '../lib/node.mjs';
-import { fetchTip, subscribeTip } from '../lib/nip333.mjs';
+import { fetchTip, subscribeTip, judgeTip as judge } from '../lib/nip333.mjs';
 import { buildTemplate, checkTemplate } from '../lib/template.mjs';
 import { makeWebMiner } from '../lib/webminer.mjs';
 const SIDESTR = 'https://cdn.jsdelivr.net/gh/sidestr/spec@cec654b7d06907130700fe52c66c3f9d0921495d/siding/lib';
 import { Mempool, subscribeMempool } from '../lib/mempool.mjs';
-import { OpfsBlockSource } from './blocks.js';
+import { OpfsBlockSource, fetchIdle, deadline } from './blocks.js';
 
 const CDN = 'https://cdn.jsdelivr.net/gh/bitcoin-desktop/schema@b8cbf6337c7450fe14ddc5bce00c7280059aab5d'; // v0.0.27, pinned by commit: a tag can move
 let engine = null;
 async function loadEngine() {
   if (engine) return engine;
   const [{ createKernel }, { knotsBlake2b }, nostr, hash] = await Promise.all([import(`${CDN}/codec/kernel.js`), import(`${CDN}/codec/overlays/knots-blake2b.js`), import(`${CDN}/codec/nostr.js`), import(`${CDN}/codec/hash.js`)]);
-  const j = async (p) => (await fetch(`${CDN}/${p}`)).json();
+  const j = async (p) => { const r = await fetch(`${CDN}/${p}`, { signal: deadline(30_000) }); if (!r.ok) throw new Error(`the engine's ${p}: ${r.status} from cdn.jsdelivr.net`); return r.json(); };
   const k = createKernel({ core: await j('schema/core.jsonld'), proof: await j('schema/proof.jsonld'), script: await j('schema/script.jsonld'), chain: await j('schema/chain.jsonld'), validate: await j('schema/validate.jsonld'), network: CHAIN.network, overlays: [knotsBlake2b(await j('schema/overlays/knots-blake2b.jsonld'))] });
   return (engine = { k, nostr, hash });
 }
@@ -63,6 +63,7 @@ async function writeSmall(name, text) { const h = await open(name, true); h.trun
 // Range-fetch the snapshot into OPFS: several ranges in flight at once (one stream is slow
 // over a long path), resuming from what is there; then the whole file is hashed once.
 async function fetchSnapshot(url, { parallel = 6, chunk = 32 << 20 } = {}) {
+  chain.fetchAbort = new AbortController();
   const h = await open(SNAPSHOT.file, true);
   // ranges are fixed-size chunks from 0; the journal lists the ones that completed, so a
   // resume after an interruption (ranges land out of order) refetches exactly what is missing
@@ -86,15 +87,19 @@ async function fetchSnapshot(url, { parallel = 6, chunk = 32 << 20 } = {}) {
       const [ci, start, end] = r; let at = start;
       for (let attempt = 0; ; attempt++) {
         try {
-          const res = await fetch(url, { headers: { range: `bytes=${at}-${end}` }, cache: 'no-store' });
-          if (res.status !== 206) throw new Error(`server answered ${res.status} to a range request (needs Range and CORS)`);
-          const reader = res.body.getReader();
-          for (;;) { if (stopErr) { reader.cancel().catch(() => {}); return; } const { value, done } = await reader.read(); if (done) break; h.write(value, { at }); at += value.length; got += value.length; report(); }
+          /* a connection that goes silent never errors by itself: aborted after 30 s without data, or by a wipe */
+          const ac = new AbortController(); let idle = null; const arm = () => { clearTimeout(idle); idle = setTimeout(() => ac.abort(new Error('no data for 30 s')), 30_000); }; const stopAll = () => ac.abort(chain.fetchAbort.signal.reason); chain.fetchAbort.signal.addEventListener('abort', stopAll, { once: true }); arm();
+          try {
+            const res = await fetch(url, { headers: { range: `bytes=${at}-${end}` }, cache: 'no-store', signal: ac.signal });
+            if (res.status !== 206) throw new Error(`server answered ${res.status} to a range request (needs Range and CORS)`);
+            const reader = res.body.getReader();
+            for (;;) { if (stopErr) { reader.cancel().catch(() => {}); return; } arm(); const { value, done } = await reader.read(); if (done) break; h.write(value, { at }); at += value.length; got += value.length; report(); }
+          } catch (e) { throw ac.signal.aborted && ac.signal.reason instanceof Error ? ac.signal.reason : e; } finally { clearTimeout(idle); chain.fetchAbort.signal.removeEventListener('abort', stopAll); }
           if (at !== end + 1) throw new Error(`short range: got to ${at}, wanted ${end + 1}`);
           h.flush(); done.add(ci); await journal();
           break;
         } catch (e) {
-          got -= at - start; at = start; if (stopErr) return;
+          got -= at - start; at = start; if (stopErr) return; if (chain.fetchAbort.signal.aborted) { stopErr ??= e; return; }
           /* offline: wait for the connection without counting it as an attempt; online: back off 1, 2, 4 … 60 s, then give up */
           if (navigator.onLine === false) { log(`range ${ci}: offline, waiting for the connection`); while (navigator.onLine === false && !stopErr) await sleep(2000); attempt--; continue; }
           if (attempt >= 7) { stopErr ??= e; return; }
@@ -105,7 +110,7 @@ async function fetchSnapshot(url, { parallel = 6, chunk = 32 << 20 } = {}) {
   };
   try { await Promise.allSettled(Array.from({ length: Math.min(parallel, ranges.length) }, () => pull().catch((e) => { stopErr ??= e; }))); }
   finally { try { h.flush(); } catch {} try { h.close(); } catch {} }
-  if (stopErr) throw new Error(`${stopErr.message}; what arrived is kept, and the fetch resumes from there`);
+  if (stopErr) throw stopErr.quiet ? stopErr : new Error(`${stopErr.message}; what arrived is kept, and the fetch resumes from there`);
   const ms = performance.now() - t0;
   post({ type: 'fetch', have: SNAPSHOT.bytes, total: SNAPSHOT.bytes, rate: total / (ms / 1000) });
   log(`fetched ${(total / 1048576).toFixed(0)} MiB in ${(ms / 1000).toFixed(1)} s (${(total / 1048576 / (ms / 1000)).toFixed(1)} MiB/s), hashing the file`);
@@ -133,10 +138,19 @@ async function verify() {
   post({ type: 'verified', ok, coins: r.coinsRead, txids: r.txids, baseHash: r.baseHash, hashSerialized: r.hashSerialized, networkMagic: r.networkMagic, ms: performance.now() - t0, indexBytes: r.entries.length });
 }
 
-async function wipe() { const d = await dir(); for (const n of [SNAPSHOT.file, `${SNAPSHOT.file}.idx`, `${SNAPSHOT.file}.sha256`, `${SNAPSHOT.file}.ranges`]) { try { await d.removeEntry(n); } catch {} } }
+// every file of the node goes (the snapshot, its index, the block mirror, the delta log, the context headers): a torn file
+// anywhere is then fixed by a wipe; answered with 'wiped' and what could not be removed
+async function wipe() {
+  const d = await dir(); let names = [];
+  try { for await (const [name] of d.entries()) names.push(name); } catch { names = [SNAPSHOT.file, `${SNAPSHOT.file}.idx`, `${SNAPSHOT.file}.sha256`, `${SNAPSHOT.file}.ranges`, `${SNAPSHOT.file}.part`, 'blocks.dat', 'blocks.json', 'deltas.json', 'context-headers.json', `context-headers-${SNAPSHOT.baseHeight}.json`]; }
+  const removed = [], failed = [];
+  for (const n of names) { try { await d.removeEntry(n, { recursive: true }); removed.push(n); } catch (e) { if (e?.name !== 'NotFoundError') failed.push(`${n}: ${e.message}`); } }
+  Object.assign(chain, { node: null, utxo: null, source: null, bytes: null, deltas: [] });
+  post({ type: 'wiped', removed, failed });
+}
 
 // ---- the chain: blocks from the served file, tip from the relays, validation against the set ----
-const chain = { node: null, utxo: null, source: null, bytes: null, nostr: null, deltas: [], syncing: false, timer: null, blocksUrl: null, mempool: null, mempoolSub: null, miner: null, solo: false, job: null, jobKey: 0 };
+const chain = { fetchAbort: new AbortController(), syncAbort: null, tipHeaders: null, node: null, utxo: null, source: null, bytes: null, nostr: null, deltas: [], syncing: false, timer: null, blocksUrl: null, mempool: null, mempoolSub: null, miner: null, solo: false, job: null, jobKey: 0 };
 // ---- mining what this tab built (datstr SPEC 6.3): the node is a gateway of one ----
 async function minerDeps() { const { k, hash } = await loadEngine(); const [pow, { blake2b }, secp, { makeSigner }] = await Promise.all([import(`${CDN}/codec/pow/knots-header-v2.js`), import(`${CDN}/codec/pow/blake2b.js`), import(`${CDN}/codec/secp256k1.js`), import(`${SIDESTR}/schnorr.mjs`)]); return { k, hash, pow, blake2b, signer: makeSigner({ hash, secp }) }; }
 async function startMining({ url, key, pay }) {
@@ -185,26 +199,35 @@ async function withSnapshot(fn) {
   const h = await open(SNAPSHOT.file); chain.bytes.attach(h);
   try { return await fn(); } finally { h.close(); chain.bytes.h = null; }
 }
+// the signed tip's headers held against what this tab applied and what the mirror serves; re-judged after every sync and
+// rollback and on every live event, so a mirror that serves another fork is caught once its block is applied or served
+function judgeTip() {
+  const t = chain.tipHeaders; if (!t || !chain.node) return;
+  const { agree, diverged } = judge(t, { applied: (h) => chain.node.chain[h], served: (h) => chain.source?.byHeight?.get(h)?.hash });
+  const prev = chain.nostr; const next = { height: t.height, hash: t.hash, relay: t.relay, created_at: t.created_at, live: !!t.live, agree, diverged };
+  if (!prev || prev.agree !== agree || prev.diverged !== diverged || prev.height !== next.height || prev.hash !== next.hash || prev.live !== next.live) { chain.nostr = next; post({ type: 'nostr', ...next }); }
+}
+const tipFrom = (t, k, live) => ({ height: t.height, hash: t.hash, relay: t.relay, created_at: t.created_at, live, first: t.first, hashes: (t.headers ?? []).map((x) => k.codec.blockHash(x)) });
 async function sync(blocksUrl, { noScripts = false } = {}) {
-  if (chain.syncing) return; chain.syncing = true;
+  if (chain.syncing) return; chain.syncing = true; chain.syncAbort = new AbortController();
   const t0 = performance.now();
   try {
     const { k, nostr } = await loadEngine();
     if (noScripts) k.blocks.interpreter = null;
     const utxo = await loadSet();
     chain.blocksUrl = blocksUrl;
-    chain.source ??= new OpfsBlockSource(k, blocksUrl, files, { log });
+    chain.source ??= new OpfsBlockSource(k, blocksUrl, files, { log, signal: () => chain.syncAbort?.signal ?? null });
     const u = await chain.source.update();
     post({ type: 'blockfile', ...u });
     const epochStart = Math.floor(SNAPSHOT.baseHeight / CHAIN.retargetInterval) * CHAIN.retargetInterval;
     if (!chain.node) {
-      const ctx = await chain.source.contextHeaders(blocksUrl.replace(/-blocks$/, '-context-headers.json'));
+      const ctx = await chain.source.contextHeaders(blocksUrl.replace(/-blocks$/, '-context-headers.json'), { from: epochStart, to: SNAPSHOT.baseHeight });
       if (ctx.from !== epochStart || ctx.to !== SNAPSHOT.baseHeight) throw new Error('context headers cover the wrong range');
       chain.node = new ChainNode({ k, utxo, epochStart, log });
       chain.node.loadContext(ctx.headers.map((h) => k.codec.decode('BlockHeader', h)));
       chain.node.setBase(SNAPSHOT.baseHeight, SNAPSHOT.baseHash);
       // our own record of blocks applied in earlier sessions, replayed if it still follows the served chain
-      chain.deltas = JSON.parse((await readSmall('deltas.json')) ?? '[]');
+      try { chain.deltas = JSON.parse((await readSmall('deltas.json')) ?? '[]'); if (!Array.isArray(chain.deltas)) throw new Error('not a list'); } catch (e) { chain.deltas = []; log(`the delta log could not be read (${e.message}): the blocks since the snapshot are validated again`); }
       let replayed = 0;
       for (const d of chain.deltas) {
         if (d.height !== chain.node.height + 1 || (await chain.source.hash(d.height)) !== d.hash) { chain.deltas.length = replayed; break; }
@@ -217,14 +240,15 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     const nip = !chain.tipAt || Date.now() - chain.tipAt > 600_000 ? await fetchTip(k, CHAIN.nip333, { nostr }) : null;
     if (!chain.tipAt || Date.now() - chain.tipAt > 600_000) chain.tipAt = Date.now();
     if (nip) {
-      let agree = 0; for (let i = 0; i < nip.headers.length; i++) { const h = nip.first + i; const have = await chain.source.hash(h); if (have && have !== k.codec.blockHash(nip.headers[i])) throw new Error(`block file disagrees with the NIP-333 headers at ${h}`); if (have) agree++; }
-      chain.nostr = { height: nip.height, hash: nip.hash, relay: nip.relay, created_at: nip.created_at, agree };
-      post({ type: 'nostr', ...chain.nostr });
+      chain.tipHeaders = tipFrom(nip, k, false);
+      for (let i = 0; i < nip.headers.length; i++) { const h = nip.first + i; const have = await chain.source.hash(h);
+        if (have && have !== chain.tipHeaders.hashes[i]) { chain.nostr = { height: nip.height, hash: nip.hash, relay: nip.relay, created_at: nip.created_at, agree: 0, diverged: true }; post({ type: 'nostr', ...chain.nostr }); throw new Error(`block file disagrees with the NIP-333 headers at ${h}`); } }
+      judgeTip();
     }
     // rollback if the served chain diverged from what we applied
     let common = chain.node.height;
     while (common > SNAPSHOT.baseHeight && (await chain.source.hash(common)) !== chain.node.chain[common]) common--;
-    if (common < chain.node.height) { log(`reorg: rolling back ${chain.node.height - common} block(s)`); chain.node.rollbackTo(common); chain.deltas = chain.deltas.filter((d) => d.height <= common); await writeSmall('deltas.json', JSON.stringify(chain.deltas)); }
+    if (common < chain.node.height) { log(`reorg: rolling back ${chain.node.height - common} block(s)`); chain.node.rollbackTo(common); chain.deltas = chain.deltas.filter((d) => d.height <= common); await writeSmall('deltas.json', JSON.stringify(chain.deltas)); judgeTip(); }
     const to = await chain.source.tip();
     let applied = 0, txs = 0;
     for (let h = chain.node.height + 1; h <= to; h++) {
@@ -236,14 +260,15 @@ async function sync(blocksUrl, { noScripts = false } = {}) {
     }
     if (applied) await writeSmall('deltas.json', JSON.stringify(chain.deltas));
     if (applied) chain.mempool?.afterBlock();
+    judgeTip();
     if (applied && chain.miner) { if (chain.solo) soloWork(`tip ${chain.node.height}`); else newWork(`tip ${chain.node.height}`); }
     post({ type: 'synced', height: chain.node.height, hash: chain.node.tipHash(), time: chain.node.headers[chain.node.height]?.time ?? null, coins: utxo.size, applied, txs, ms: performance.now() - t0, stats: chain.node.stats, scripts: !noScripts, quiet: applied === 0 && !!chain.timer });
     if (!chain.timer) {
       chain.timer = setInterval(() => enqueue(() => withSnapshot(() => sync(chain.blocksUrl, { noScripts }))), 30_000);
       chain.noScripts = noScripts;
-      chain.tipSub = await subscribeTip(k, CHAIN.nip333, (t) => { chain.tipAt = Date.now(); chain.nostr = { ...t, agree: chain.node.chain[t.height] === t.hash ? 1 : 0, diverged: !!chain.node.chain[t.height] && chain.node.chain[t.height] !== t.hash }; post({ type: 'nostr', ...chain.nostr, live: true }); if (t.height > chain.node.height) setTimeout(() => enqueue(() => withSnapshot(() => sync(chain.blocksUrl, { noScripts }))), 3000); }, { nostr, log });
+      chain.tipSub = await subscribeTip(k, CHAIN.nip333, (t) => { chain.tipAt = Date.now(); if (chain.tipHeaders && t.height < chain.tipHeaders.height) return; /* an older event replayed by a relay says nothing new */ chain.tipHeaders = tipFrom(t, k, true); judgeTip(); if (t.height > chain.node.height) setTimeout(() => enqueue(() => withSnapshot(() => sync(chain.blocksUrl, { noScripts }))), 3000); }, { nostr, log });
     }
-  } finally { chain.syncing = false; }
+  } finally { chain.syncing = false; chain.syncAbort = null; }
 }
 // the page's view of the mempool: every transaction with what a wallet needs (inputs, outputs, fee); posted on change, at most every 200 ms
 let mpTimer = null; const watch = { scripts: new Set(), outpoints: new Set() }; // a wallet's scripts and coins: their transactions are always sent, past the first 1,000
@@ -261,12 +286,18 @@ async function coin(key) {
 // one job at a time: every job opens OPFS handles, and two jobs interleaving at an await
 // would try to open the same file twice
 let queue = Promise.resolve();
-const enqueue = (fn) => (queue = queue.then(fn).catch((err) => post({ type: 'error', text: err.message })));
-self.onmessage = (e) => enqueue(() => handle(e.data));
+const enqueue = (fn) => (queue = queue.then(fn).catch((err) => (err?.quiet ? log(err.message) : post({ type: 'error', text: err.message }))));
+// wake and wipe do not wait behind a job stuck on a dead connection: a wake aborts the sync in flight (a fresh one follows), a
+// wipe stops the timer, the fetches and the subscriptions first. Errors of an abort asked for here are not the node's errors.
+const quiet = (text) => Object.assign(new Error(text), { quiet: true });
+self.onmessage = (e) => { const m = e.data;
+  if (m.type === 'wake') { chain.tipSub?.reopen(); chain.mempoolSub?.reopen(); if (chain.syncing) chain.syncAbort?.abort(quiet('the page woke: a fresh sync replaces the one in flight')); }
+  else if (m.type === 'wipe') { if (chain.timer) { clearInterval(chain.timer); chain.timer = null; } chain.syncAbort?.abort(quiet('wiping')); chain.fetchAbort.abort(quiet('wiping')); try { chain.tipSub?.close(); chain.mempoolSub?.close(); chain.miner?.close?.(); } catch {} chain.tipSub = chain.mempoolSub = chain.miner = null; }
+  enqueue(() => handle(m)); };
 async function handle(m) {
   try {
     if (m.type === 'sync') await withSnapshot(() => sync(m.blocksUrl, { noScripts: !!m.noScripts }));
-    else if (m.type === 'wake') { /* the page was asleep or offline: sockets may be half-dead, so open them again and look for blocks */ chain.tipSub?.reopen(); chain.mempoolSub?.reopen(); if (chain.node && chain.blocksUrl) await withSnapshot(() => sync(chain.blocksUrl, { noScripts: !!chain.noScripts })); }
+    else if (m.type === 'wake') { /* the page was asleep or offline: sockets were reopened on arrival; look for blocks */ if (chain.node && chain.blocksUrl) await withSnapshot(() => sync(chain.blocksUrl, { noScripts: !!chain.noScripts })); }
     else if (m.type === 'close') { if (chain.timer) { clearInterval(chain.timer); chain.timer = null; } }
     else if (m.type === 'debug') await withSnapshot(async () => {
       const u = chain.utxo; const c = u?.get(m.key) ?? null; let cl = null, err = null;
@@ -303,7 +334,7 @@ async function handle(m) {
       // a check reads the UTXO set, which needs the snapshot attached: adds from the relays are queued as jobs like everything else
       const rawAdd = mp.add.bind(mp); mp.add = (hex, from) => { enqueue(() => withSnapshot(() => { rawAdd(hex, from); })); return { ok: true, queued: true }; };
       chain.mempoolSub = await subscribeMempool(mp, { relays: m.relays, network: CHAIN.network, nostr, also: m.also ?? [], log });
-      if (m.seedUrl) { try { const r = await fetch(m.seedUrl, { cache: 'no-store' }); if (r.ok) { const j = await r.json(); let n = 0; await withSnapshot(() => { for (const t of j.txs ?? []) { if (rawAdd(t.hex, 'the mirror').ok) n++; } }); log(`mempool: ${n} of ${(j.txs ?? []).length} from the mirror's file at height ${j.height}`); } } catch (e) { log(`mempool: seed file: ${e.message}`); } }
+      if (m.seedUrl) { try { const { res: r, bytes } = await fetchIdle(m.seedUrl, { cache: 'no-store' }); if (r.ok) { const j = JSON.parse(new TextDecoder().decode(bytes)); let n = 0; await withSnapshot(() => { for (const t of j.txs ?? []) { if (rawAdd(t.hex, 'the mirror').ok) n++; } }); log(`mempool: ${n} of ${(j.txs ?? []).length} from the mirror's file at height ${j.height}`); } } catch (e) { log(`mempool: seed file: ${e.message}`); } }
       postMempool(true); }
     else if (m.type === 'mempool-list') postMempool(true);
     else if (m.type === 'mine') await withSnapshot(() => startMining(m));
@@ -320,5 +351,5 @@ async function handle(m) {
     else if (m.type === 'hash') { const hex = await hashFile(); post({ type: 'fetched', bytes: await sizeOf(SNAPSHOT.file), ms: 0, sha256: hex, ok: hex === SNAPSHOT.sha256 }); await status(); }
     else if (m.type === 'verify') { await verify(); await status(); }
     else if (m.type === 'wipe') { await wipe(); await status(); }
-  } catch (err) { post({ type: 'error', text: err.message + (err.stack ? ' @ ' + err.stack.split('\n').slice(1, 4).map((l) => l.trim()).join(' < ') : '') }); }
+  } catch (err) { if (err?.quiet) return log(err.message); post({ type: 'error', text: err.message + (err.stack ? ' @ ' + err.stack.split('\n').slice(1, 4).map((l) => l.trim()).join(' < ') : '') }); }
 }

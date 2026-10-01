@@ -45,7 +45,7 @@ async function once() {
     appendBlock(dat, index, h, hash, Buffer.from(await rpc('getblock', hash, 0), 'hex'));
     added++;
   }
-  if (added) { writeIndex(idx, index); log(`+${added} blocks, file now ${index.from}-${index.to} (${index.blocks.length} blocks)`); }
+  if (added) { writeIndex(idx, index, dat); log(`+${added} blocks, file now ${index.from}-${index.to} (${index.blocks.length} blocks)`); }
   else if (!existsSync(idx)) writeIndex(idx, index);
   if (RSYNC && (added || !pushed)) await push();
 }
