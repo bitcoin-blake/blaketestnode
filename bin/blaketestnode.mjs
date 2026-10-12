@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// blaketestnode: fetch | verify | sync | bench | run   (--data <dir>, --source http|rpc, --blocks-url <url>, --webseed <url>, --conf <bitcoin.conf>, --no-scripts, --to <height>, --api <port>, --poll <s>, --checkpoint-every <n>, --address-index, --pair-api <url>)
+// blaketestnode: fetch | verify | sync | bench | run   (--data <dir>, --source http|rpc, --blocks-url <url>, --webseed <url>, --conf <bitcoin.conf>, --no-scripts, --to <height>, --api <port>, --poll <s>, --checkpoint-every <n>, --address-index, --pair-api <url>, --record [history.jsonl])
 import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { CHAIN, SNAPSHOT } from '../lib/params.mjs';
@@ -21,6 +21,9 @@ import { SCHEMA } from '../lib/engine.mjs';
 import { DeltaLog, applyDelta } from '../lib/delta.mjs';
 import { ScriptIndex, buildScriptKeys, scriptIndexBytes, parseScriptIndexBytes, followSet } from '../lib/scriptindex.mjs';
 import { makePair } from '../lib/pair.mjs';
+import { benchRecord, runContext, appendRecord } from '../lib/benchlog.mjs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const argv = process.argv.slice(2);
 const cmd = argv[0] ?? 'bench';
@@ -33,6 +36,8 @@ const SOURCE = opt('--source', 'http'); // http: a served block file + NIP-333 t
 if (opt('--blocks-url')) CHAIN.blocksUrl = opt('--blocks-url');
 if (opt('--webseed')) SNAPSHOT.webseed = opt('--webseed');
 const API = Number(opt('--api', 3337)); const POLL = Number(opt('--poll', 30)); const CKPT = Number(opt('--checkpoint-every', 2016));
+const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const RECORD = argv.includes('--record') ? (opt('--record') && !opt('--record').startsWith('--') ? opt('--record') : `${REPO}/bench/history.jsonl`) : null;
 const ADDRESS_INDEX = argv.includes('--address-index'); const PAIR_API = opt('--pair-api') ?? process.env.BLAKETESTNODE_PAIR_API ?? null;
 const log = (...a) => console.error(new Date().toISOString().slice(11, 19), ...a);
 const bench = {};
@@ -160,6 +165,7 @@ async function sync(utxo) {
   const all = [...contextHeaders, ...headers]; // for MTP windows
   const rulesNull = new Map(), rulesFailed = new Map();
   let txs = 0, validateMs = 0, applyMs = 0, created = 0, spent = 0, failed = 0;
+  const series = []; // [height, ms since the first block] every 200 blocks and at the tip
   const tAll = performance.now();
   for (let h = startHeight; h <= tip; h++) {
     const block = blocks[h];
@@ -177,10 +183,10 @@ async function sync(utxo) {
     if (!s.ok || !c.ok) { failed++; if (failed <= 5) log(`block ${h} failed:`, [...s.results, ...c.results].filter((r) => r.ok === false).map((r) => r.rule).join(', '), c.spending.missing.slice(0, 2)); }
     t = performance.now();
     const a = k.blocks.applyBlock(utxo, block, h); applyMs += performance.now() - t; created += a.created; spent += a.spent;
-    if ((h - startHeight) % 200 === 199) log(`  block ${h}, ${txs} txs, ${mb()}`);
+    if ((h - startHeight) % 200 === 199 || h === tip) { series.push([h, Math.round(performance.now() - tAll)]); if (h !== tip) log(`  block ${h}, ${txs} txs, ${mb()}`); }
   }
   const ms = performance.now() - tAll;
-  bench.blocks = { from: startHeight, to: tip, count: tip - startHeight + 1, txs, MiB: +(bytes / 1048576).toFixed(1), ms: +ms.toFixed(0), blocksPerSec: +((tip - startHeight + 1) / (ms / 1000)).toFixed(1), fetchMs: +fetchMs.toFixed(0), decodeMs: +decodeMs.toFixed(0), validateMs: +validateMs.toFixed(0), applyMs: +applyMs.toFixed(0), failed, created, spent, utxoSize: utxo.size, skippedRules: Object.fromEntries(rulesNull), failedRules: Object.fromEntries(rulesFailed), scripts: !NO_SCRIPTS, source: http ? 'http' : 'rpc', rss: mb() };
+  bench.blocks = { from: startHeight, to: tip, count: tip - startHeight + 1, txs, MiB: +(bytes / 1048576).toFixed(1), ms: +ms.toFixed(0), blocksPerSec: +((tip - startHeight + 1) / (ms / 1000)).toFixed(1), fetchMs: +fetchMs.toFixed(0), decodeMs: +decodeMs.toFixed(0), validateMs: +validateMs.toFixed(0), applyMs: +applyMs.toFixed(0), failed, created, spent, utxoSize: utxo.size, skippedRules: Object.fromEntries(rulesNull), failedRules: Object.fromEntries(rulesFailed), scripts: !NO_SCRIPTS, source: http ? 'http' : 'rpc', rss: mb(), series };
   log(`blocks: ${bench.blocks.count} validated to ${tip}, ${failed} failed, ${txs} txs, ${(ms / 1000).toFixed(1)} s`);
   // cross-check the resulting set against a node when one is reachable
   if (rpc) {
@@ -315,5 +321,6 @@ try {
   else if (cmd === 'sync') await sync(load());
   else if (cmd === 'bench') { await fetch(); await sync(load()); }
   else throw new Error(`unknown command ${cmd}`);
+  if (RECORD && bench.blocks) { const r = appendRecord(RECORD, benchRecord(bench, runContext({ repo: REPO, schema: SCHEMA }))); log(`recorded in ${RECORD}: ${r.blocks} blocks, ${r.blocksPerSec} blocks/s, ${r.usPerTx} µs/tx`); }
   console.log(JSON.stringify(bench, null, 2));
 } catch (e) { log('error:', e.message); console.log(JSON.stringify(bench, null, 2)); process.exit(1); }

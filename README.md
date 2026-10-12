@@ -51,6 +51,7 @@ Part of the [bitcoin-blake](https://github.com/bitcoin-blake) family, next to
 ```
 node --max-old-space-size=8192 bin/blaketestnode.mjs run --api 3337 --blocks-url <url>   # the daemon (pm2 example in ops/)
 node --max-old-space-size=8192 bin/blaketestnode.mjs bench            # fetch, verify, sync: no node needed
+node --max-old-space-size=8192 bin/blaketestnode.mjs bench --record   # ...and append the run to bench/history.jsonl
 node bin/blaketestnode.mjs verify --data ./data                        # snapshot only
 node bin/blaketestnode.mjs sync --source rpc                           # blocks from the local node
 node bin/blaketestnode.mjs sync --no-scripts                           # skip signature checks
@@ -187,6 +188,21 @@ Post-fork transactions are signed with `SIGHASH_ALL | SIGHASH_UNIFIED` (0x21), t
 fork's replay protection. Engine v0.0.25 fails 16 blocks on that; from v0.0.26
 ([bitcoin-desktop/schema#92](https://github.com/bitcoin-desktop/schema/pull/92)) every block
 validates with scripts on. Signature checks are about 48 of the 51 s, pure-JS secp256k1.
+
+## Benchmarks over time
+
+`bench --record` appends one line per run to `bench/history.jsonl` (stage times, blocks per second,
+microseconds per transaction, the commit, engine version, Node and processor that ran it, and the
+time at every 200th block). `node tools/bench-report.mjs` rewrites the table below and
+`bench/history.svg` from it. Runs are on one core of the same desktop unless the line says otherwise.
+
+![benchmark history](bench/history.svg)
+
+<!-- bench:start -->
+| date | commit | engine | blocks | txs | scripts | parse | coins/s | headers | blocks | validate | blocks/s | µs/tx | utxo |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2026-09-14 | 98d5084 | 0.0.26 | 763 | 5,045 | on | 26 s | 540,069 | 164 ms | 52 s | 50 s | 14.7 | 10,003 | match |
+<!-- bench:end -->
 
 ## Layout
 
