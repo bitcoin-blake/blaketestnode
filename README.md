@@ -54,12 +54,16 @@ who need to run, check or extend it.
 ```
 node --max-old-space-size=8192 bin/blaketestnode.mjs run --api 3337 --blocks-url <url>   # the daemon (pm2 example in ops/)
 node --max-old-space-size=8192 bin/blaketestnode.mjs bench            # fetch, verify, sync: no node needed
-node --max-old-space-size=8192 bin/blaketestnode.mjs bench --record   # ...and append the run to bench/history.jsonl
+node --max-old-space-size=8192 bin/blaketestnode.mjs bench --record --compare   # ...append the run to bench/history.jsonl and show the change since the last
+node bin/blaketestnode.mjs status [--watch 2] [--api 3337]          # a running daemon in a few lines; --watch keeps it fresh
 node bin/blaketestnode.mjs verify --data ./data                        # snapshot only
 node bin/blaketestnode.mjs sync --source rpc                           # blocks from the local node
 node bin/blaketestnode.mjs sync --no-scripts                           # skip signature checks
 node tools/export-blocks.mjs --loop 20                                 # keep the served block file current (needs a node)
 ```
+
+On a terminal `bench`, `sync` and a daemon catching up show one progress line (stage, rate, µs per
+transaction, time left); under pm2 or a redirect only the log lines are written.
 
 Options: `--data <dir>` (default `~/.blaketestnode/txbt4`), `--source http|rpc`, `--blocks-url <url>`,
 `--webseed <url>`, `--conf <bitcoin.conf>`, `--to <height>`, `--no-scripts`; for `run` also `--api <port>`,

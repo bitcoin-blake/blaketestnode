@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// blaketestnode: fetch | verify | sync | bench | run   (--data <dir>, --source http|rpc, --blocks-url <url>, --webseed <url>, --conf <bitcoin.conf>, --no-scripts, --to <height>, --api <port>, --poll <s>, --checkpoint-every <n>, --address-index, --pair-api <url>, --record [history.jsonl])
+// blaketestnode: fetch | verify | sync | bench | run | status   (--watch [s], --url, --compare, --data <dir>, --source http|rpc, --blocks-url <url>, --webseed <url>, --conf <bitcoin.conf>, --no-scripts, --to <height>, --api <port>, --poll <s>, --checkpoint-every <n>, --address-index, --pair-api <url>, --record [history.jsonl])
 import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { CHAIN, SNAPSHOT } from '../lib/params.mjs';
@@ -21,7 +21,9 @@ import { SCHEMA } from '../lib/engine.mjs';
 import { DeltaLog, applyDelta } from '../lib/delta.mjs';
 import { ScriptIndex, buildScriptKeys, scriptIndexBytes, parseScriptIndexBytes, followSet } from '../lib/scriptindex.mjs';
 import { makePair } from '../lib/pair.mjs';
-import { benchRecord, runContext, appendRecord } from '../lib/benchlog.mjs';
+import { benchRecord, runContext, appendRecord, readRecords, compareText } from '../lib/benchlog.mjs';
+import { Progress, parseLine, blocksLine } from '../lib/progress.mjs';
+import { renderStatus } from '../lib/statuscli.mjs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -39,7 +41,8 @@ const API = Number(opt('--api', 3337)); const POLL = Number(opt('--poll', 30)); 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const RECORD = argv.includes('--record') ? (opt('--record') && !opt('--record').startsWith('--') ? opt('--record') : `${REPO}/bench/history.jsonl`) : null;
 const ADDRESS_INDEX = argv.includes('--address-index'); const PAIR_API = opt('--pair-api') ?? process.env.BLAKETESTNODE_PAIR_API ?? null;
-const log = (...a) => console.error(new Date().toISOString().slice(11, 19), ...a);
+const progress = new Progress();
+const log = (...a) => { progress.end(); console.error(new Date().toISOString().slice(11, 19), ...a); };
 const bench = {};
 const newHasher = await hasherFactory();
 const mb = () => (process.memoryUsage().rss / 1048576).toFixed(0) + ' MiB rss';
@@ -68,7 +71,9 @@ function load({ path = snapPath, sha256 = SNAPSHOT.sha256, expect = SNAPSHOT } =
   }
   if (!index) {
     const t0 = performance.now();
-    const r = buildIndex(source, { hash: true, hasher: newHasher, log });
+    const total = source.size ?? expect.bytes ?? SNAPSHOT.bytes;
+    const r = buildIndex(source, { hash: true, hasher: newHasher, log, onProgress: (p) => progress.line(parseLine({ ...p, total })) });
+    progress.end();
     bench.parse = { ms: +r.ms.toFixed(0), coins: r.coinsRead, txids: r.txids, coinsPerSec: Math.round(r.coinsRead / (r.ms / 1000)), rss: mb() };
     const checks = { magic: true, network: r.networkMagic === CHAIN.networkMagic, baseHash: r.baseHash === (expect.baseHash ?? expect.base_hash), coins: r.coinsRead === expect.coins, hashSerialized: r.hashSerialized === (expect.txoutsetHash ?? expect.txoutset_hash) };
     bench.snapshot = { ...checks, baseHash: r.baseHash, hashSerialized: r.hashSerialized };
@@ -184,7 +189,9 @@ async function sync(utxo) {
     t = performance.now();
     const a = k.blocks.applyBlock(utxo, block, h); applyMs += performance.now() - t; created += a.created; spent += a.spent;
     if ((h - startHeight) % 200 === 199 || h === tip) { series.push([h, Math.round(performance.now() - tAll)]); if (h !== tip) log(`  block ${h}, ${txs} txs, ${mb()}`); }
+    progress.line(blocksLine({ done: h - startHeight + 1, total: tip - startHeight + 1, height: h, ms: performance.now() - tAll, validateMs, txs }));
   }
+  progress.end();
   const ms = performance.now() - tAll;
   bench.blocks = { from: startHeight, to: tip, count: tip - startHeight + 1, txs, MiB: +(bytes / 1048576).toFixed(1), ms: +ms.toFixed(0), blocksPerSec: +((tip - startHeight + 1) / (ms / 1000)).toFixed(1), fetchMs: +fetchMs.toFixed(0), decodeMs: +decodeMs.toFixed(0), validateMs: +validateMs.toFixed(0), applyMs: +applyMs.toFixed(0), failed, created, spent, utxoSize: utxo.size, skippedRules: Object.fromEntries(rulesNull), failedRules: Object.fromEntries(rulesFailed), scripts: !NO_SCRIPTS, source: http ? 'http' : 'rpc', rss: mb(), series };
   log(`blocks: ${bench.blocks.count} validated to ${tip}, ${failed} failed, ${txs} txs, ${(ms / 1000).toFixed(1)} s`);
@@ -278,8 +285,10 @@ async function run() {
       }
       const to = source.index.to;
       if (to > node.height) st.state = 'syncing';
-      for (let h = node.height + 1; h <= to; h++) {
+      const catchFrom = node.height + 1, tCatch = performance.now();
+      for (let h = catchFrom; h <= to; h++) {
         const r = node.applyNext(h, await source.blockHex(h));
+        if (to - catchFrom >= 20) progress.line(blocksLine({ done: h - catchFrom + 1, total: to - catchFrom + 1, height: h, ms: performance.now() - tCatch }));
         const u = node.undo.at(-1); deltas.append({ height: h, hash: r.hash, spent: u.spent.map(([key]) => key), created: u.created.map((key) => [key, utxo.get(key)]).filter(([, c]) => c) }); // a coin spent in its own block is gone already
         st.tipTime = r.time; sinceSave++; dirty = false; mempool?.afterBlock();
         api?.broadcast({ type: 'block', height: h, hash: r.hash, txs: r.txs, time: r.time });
@@ -313,7 +322,20 @@ async function roundtrip() {
   unlinkSync(out);
 }
 
+// status: a running daemon's /status.json as a few lines; --watch [s] keeps it fresh
+async function status() {
+  const url = opt('--url', `http://127.0.0.1:${API}/status.json`);
+  const w = argv.includes('--watch') ? (Number(opt('--watch')) || 2) : 0;
+  for (;;) {
+    let s; try { s = await (await globalThis.fetch(url)).json(); } catch (e) { throw new Error(`no daemon at ${url} (${e.cause?.code ?? e.message})`); }
+    const text = renderStatus(s);
+    if (w) process.stdout.write(`\x1b[H\x1b[2J${text}\n\n${url} · every ${w} s · ctrl-c to stop\n`); else console.log(text);
+    if (!w) return; await new Promise((res) => setTimeout(res, w * 1000));
+  }
+}
+
 try {
+  if (cmd === 'status') { await status(); process.exit(0); }
   if (cmd === 'run') await run();
   else if (cmd === 'roundtrip') await roundtrip();
   else if (cmd === 'fetch') await fetch();
@@ -321,6 +343,12 @@ try {
   else if (cmd === 'sync') await sync(load());
   else if (cmd === 'bench') { await fetch(); await sync(load()); }
   else throw new Error(`unknown command ${cmd}`);
-  if (RECORD && bench.blocks) { const r = appendRecord(RECORD, benchRecord(bench, runContext({ repo: REPO, schema: SCHEMA }))); log(`recorded in ${RECORD}: ${r.blocks} blocks, ${r.blocksPerSec} blocks/s, ${r.usPerTx} µs/tx`); }
+  if (bench.blocks && (RECORD || argv.includes('--compare'))) {
+    const history = RECORD ?? `${REPO}/bench/history.jsonl`;
+    const cur = benchRecord(bench, runContext({ repo: REPO, schema: SCHEMA }));
+    const earlier = readRecords(history);
+    if (RECORD) { appendRecord(RECORD, cur); log(`recorded in ${RECORD}: ${cur.blocks} blocks, ${cur.blocksPerSec} blocks/s, ${cur.usPerTx} µs/tx`); }
+    if (argv.includes('--compare')) { const prev = [...earlier].reverse().find((x) => x.scripts === cur.scripts); console.error(prev ? compareText(prev, cur) : `no earlier run with scripts ${cur.scripts ? 'on' : 'off'} in ${history}`); }
+  }
   console.log(JSON.stringify(bench, null, 2));
-} catch (e) { log('error:', e.message); console.log(JSON.stringify(bench, null, 2)); process.exit(1); }
+} catch (e) { log('error:', e.message); if (cmd !== 'status') console.log(JSON.stringify(bench, null, 2)); process.exit(1); }

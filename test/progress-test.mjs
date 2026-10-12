@@ -1,0 +1,31 @@
+// The terminal pieces: the progress line (lib/progress.mjs), the status lines (lib/statuscli.mjs), the run-to-run comparison (lib/benchlog.mjs compareText).
+import { Progress, parseLine, blocksLine, fmtDuration, fmtAgo } from '../lib/progress.mjs';
+import { renderStatus } from '../lib/statuscli.mjs';
+import { compareText } from '../lib/benchlog.mjs';
+let pass = 0, fail = 0; const t = (name, ok, d = '') => { console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name}${ok || !d ? '' : `\n        ${d}`}`); ok ? pass++ : fail++; };
+const fake = (tty) => { const out = []; return { isTTY: tty, columns: 60, write: (x) => out.push(x), out }; };
+let st = fake(true); let p = new Progress(st, { minMs: 0 });
+t('on a terminal the line is rewritten in place and cleared at the end', p.line('one') && p.line('two') && (p.end(), st.out.length === 3 && st.out[1].startsWith('\r\x1b[2K') && st.out[1].endsWith('two') && st.out[2] === '\r\x1b[2K'));
+t('a long line is cut to the terminal width', (st = fake(true), p = new Progress(st, { minMs: 0 }), p.line('x'.repeat(200)), st.out[0].length === '\r\x1b[2K'.length + 59));
+t('not a terminal: nothing is written, end is silent', (st = fake(false), p = new Progress(st), !p.line('one') && (p.end(), st.out.length === 0)));
+t('lines closer than minMs are dropped, force overrides', (st = fake(true), p = new Progress(st, { minMs: 100000 }), p.line('a') && !p.line('b') && p.line('c', { force: true })));
+t('durations and ages read naturally', fmtDuration(12.4) === '12 s' && fmtDuration(75) === '1 m 15 s' && fmtDuration(3700) === '1 h 1 m' && fmtDuration(null) === '?' && fmtAgo(30) === '30 s ago' && fmtAgo(600) === '10 min ago' && fmtAgo(7200) === '2.0 h ago');
+const pl = parseLine({ count: 7_000_000, pos: 435_000_000, total: 870_000_000, ms: 5000 });
+t('the parse line: half the file, coins, rate and the time left', pl.includes('50%') && pl.includes('7,000,000 coins') && pl.includes('1,400,000 coins/s') && pl.includes('eta 5 s'), pl);
+const bl = blocksLine({ done: 500, total: 2000, height: 150807, ms: 10000, validateMs: 9000, txs: 3000 });
+t('the blocks line: done of total, height, blocks/s, µs/tx, eta', bl.includes('500/2,000 at 150807') && bl.includes('50.0 blocks/s') && bl.includes('3,000 µs/tx') && bl.includes('eta 30 s'), bl);
+t('a blocks line without validate time omits µs/tx', !blocksLine({ done: 1, total: 2, height: 1, ms: 10 }).includes('µs/tx'));
+const now = 1_800_000_000;
+const s = { alias: 'txbt4', state: 'synced', height: 152892, hash: '00000000db5d82b8456b2b46c18aa54f11fc56883d76d4d4adfe2057e22fdc39', coins: 14241179, saving: false, tipTime: now - 700, lastTickAt: now - 3, uptimeS: 4098, rssMiB: 361,
+  checkpoint: { height: 151097, hash: '00000000bb290d2ca5dbc95a2cc756278ddb31967492c720574df7661d219cf8' }, deltas: 1795, nostr: { height: 152888, hash: 'x', relay: 'wss://relay.damus.io', created_at: now - 5000, agree: true }, file: { from: 150308, to: 152892, blocks: 2585, at: now - 3 }, run: { blocks: 2585, txs: 14650, validateMs: 60000, failed: 0, rollbacks: 0, startedFrom: 150308 } };
+const text = renderStatus(s, now);
+t('status: the first line has chain, state, height, tip and coins', text.split('\n')[0] === 'txbt4  synced  height 152,892  00000000db5d82b8…  coins 14,241,179', text.split('\n')[0]);
+t('status: a stale nostr tip says how far behind and how old', text.includes('nostr tip 152,888 agrees, 4 behind · 83 min ago via relay.damus.io'), text);
+t('status: checkpoint, deltas, block file and the run line are there', text.includes('checkpoint 151,097') && text.includes('deltas 1,795') && text.includes('block file 150,308–152,892 (2,585 blocks)') && text.includes('this run: 2,585 blocks, 14,650 txs, 1 m 0 s validating, 0 failed, 0 rollbacks, from 150,308'));
+t('status: no nostr tip, no checkpoint, extras line', (() => { const x = renderStatus({ ...s, nostr: null, checkpoint: null, mempool: { count: 3 }, pair: { alias: 'tbtc4' }, addressIndex: 'loading' }, now); return x.includes('nostr tip: none heard') && x.includes('none (fork snapshot)') && x.includes('mempool 3 · address index loading · pair tbtc4'); })());
+const prev = { at: '2026-09-14T08:52:00.000Z', commit: '98d5084', engine: { version: '0.0.26' }, parseMs: 26349, coinsPerSec: 540069, blocks: 763, validateMs: 50467, blocksPerSec: 14.7, usPerTx: 10003 };
+const cur = { at: '2026-10-12T10:32:00.000Z', commit: '86bcc68', engine: { version: '0.0.27' }, parseMs: 9500, coinsPerSec: 1497025, blocks: 2584, validateMs: 60500, blocksPerSec: 42.7, usPerTx: 4108 };
+const c = compareText(prev, cur);
+t('compare: names the earlier run, lower times are better, higher rates are better, counts are not judged', c.startsWith('vs 2026-09-14 98d5084 (engine 0.0.26):') && /parse\s+26 s →\s+9\.5 s\s+-64% better/.test(c) && /coins\/s.*\+177% better/.test(c) && /blocks\s+763 →\s+2,584$/m.test(c) && /validate.*\+20% worse/.test(c) && /µs\/tx.*-59% better/.test(c), c);
+t('compare: a missing value shows a dash and no verdict; a tiny change says same', (() => { const x = compareText({ ...prev, parseMs: null }, { ...cur, usPerTx: 10050 }); return /parse\s+— →\s+9\.5 s$/m.test(x) && /µs\/tx.*same$/m.test(x); })());
+console.log(`\n${pass} passed, ${fail} failed`); process.exit(fail ? 1 : 0);

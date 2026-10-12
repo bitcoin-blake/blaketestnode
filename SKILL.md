@@ -109,15 +109,17 @@ can be compared on both.
 commit, Node, processor, stage times, blocks per second, µs per transaction, whether the coin count
 matched, and the elapsed time at every 200th block. `node tools/bench-report.mjs` rewrites the table in
 README.md (between `<!-- bench:start -->` and `<!-- bench:end -->`) and draws `bench/history.svg`.
-Compare runs by µs per transaction with scripts on; block counts grow with the chain, so blocks per second
+`bench --record --compare` also prints the change since the previous run with the same scripts setting.
+On a terminal the long stages show one progress line with the rate and the time left. Compare runs by µs per transaction with scripts on; block counts grow with the chain, so blocks per second
 alone is not a fair comparison across dates.
 
 ## Checking it
 
 - `node --test` runs every file in `test/` (zero dependencies beyond webtorrent). `test/webminer-test.mjs`
   needs `BLAKETESTNODE_BLOCKS_URL` set to a blocks mirror and fails by design without it.
-- `curl http://127.0.0.1:3337/status.json` for a running daemon: `state` should be `synced` and `height`
-  should equal the Knots node's.
+- `node bin/blaketestnode.mjs status` (or `--watch 2`) prints a running daemon in a few lines: state, height, tip,
+  coins, checkpoint and delta count, the Nostr tip with how far behind and how old it is, the block file, this run's
+  totals. `state` should be `synced` and `height` should equal the Knots node's. It reads `/status.json`.
 - `node bin/blaketestnode.mjs verify --data <dir>` proves a snapshot file alone.
 - `node bin/blaketestnode.mjs roundtrip` proves the writer: the packed set rewritten as a snapshot
   must hash to the original.
