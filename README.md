@@ -9,6 +9,9 @@ Part of the [bitcoin-blake](https://github.com/bitcoin-blake) family, next to
 [blaketest](https://github.com/bitcoin-blake/blaketest) (the wallet) and the
 [datstr](https://datstr.com/) pool.
 
+[SKILL.md](SKILL.md) is the short account of how the node works, written for people and agents
+who need to run, check or extend it.
+
 ## What it does
 
 1. **fetch** the snapshot over WebTorrent (magnet with WebRTC and udp trackers, plus an
