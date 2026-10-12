@@ -202,6 +202,7 @@ time at every 200th block). `node tools/bench-report.mjs` rewrites the table bel
 | date | commit | engine | blocks | txs | scripts | parse | coins/s | headers | blocks | validate | blocks/s | µs/tx | utxo |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | 2026-09-14 | 98d5084 | 0.0.26 | 763 | 5,045 | on | 26 s | 540,069 | 164 ms | 52 s | 50 s | 14.7 | 10,003 | match |
+| 2026-10-12 | 533cad2 | 0.0.27 | 2,577 | 14,597 | on | 10 s | 1,374,028 | 280 ms | 61 s | 61 s | 42.3 | 4,150 | match |
 <!-- bench:end -->
 
 ## Layout
