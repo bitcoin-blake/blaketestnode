@@ -1,6 +1,9 @@
 #!/usr/bin/env node
-// blaketestnode: fetch | verify | sync | bench | run | status   (--watch [s], --url, --compare, --data <dir>, --source http|rpc, --blocks-url <url>, --webseed <url>, --conf <bitcoin.conf>, --no-scripts, --to <height>, --api <port>, --poll <s>, --checkpoint-every <n>, --address-index, --pair-api <url>, --record [history.jsonl])
-import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
+// blaketestnode: fetch | verify | sync | bench | run | status | epoch build | epoch verify <file|height>   (--watch [s], --url, --compare, --data <dir>, --source http|rpc, --blocks-url <url>, --webseed <url>, --conf <bitcoin.conf>, --no-scripts, --to <height>, --api <port>, --poll <s>, --checkpoint-every <n>, --address-index, --pair-api <url>, --record [history.jsonl])
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, statSync } from 'node:fs';
+import { bytesToHex } from '../lib/bytes.mjs';
+import { MuHash3072, coinBytes, valueHex, valueFromHex, digestOf } from '../lib/muhash.mjs';
+import { EpochTally, makePackage, packageText, verifyEpoch } from '../lib/epoch.mjs';
 import { homedir } from 'node:os';
 import { CHAIN, SNAPSHOT } from '../lib/params.mjs';
 import { writeSnapshot } from '../lib/snapshot-write.mjs';
@@ -322,6 +325,113 @@ async function roundtrip() {
   unlinkSync(out);
 }
 
+// blocks and the pre-fork context headers, from the served block file or the local node (as sync opens them)
+async function openBlocks(k) {
+  const http = SOURCE !== 'rpc';
+  let rpc = null;
+  if (!http || existsSync(CONF.replace(/^~/, homedir()))) { try { rpc = await makeRpc(CONF, CHAIN.network); await rpc('getblockcount'); } catch { rpc = null; } }
+  if (!http && !rpc) throw new Error(`--source rpc needs a node at ${CONF}`);
+  if (http && !CHAIN.blocksUrl) throw new Error('no block source: pass --blocks-url <url> (a served txbt4-blocks file) or --source rpc');
+  const source = http ? new HttpBlockSource(k, CHAIN.blocksUrl, DATA, { log }) : new RpcBlockSource(rpc);
+  const epochStart = Math.floor(SNAPSHOT.baseHeight / CHAIN.retargetInterval) * CHAIN.retargetInterval;
+  let contextHeaders;
+  if (http) {
+    const u = await source.update(); log(`block file ${u.from}-${u.to}: ${u.fetched} bytes fetched, ${u.verified} blocks hash-checked`);
+    const ctx = await source.contextHeaders(CHAIN.blocksUrl.replace(/-blocks$/, '-context-headers.json'));
+    if (ctx.from !== epochStart || ctx.to !== SNAPSHOT.baseHeight) throw new Error('context headers cover the wrong range');
+    contextHeaders = ctx.headers.map((h) => k.codec.decode('BlockHeader', h));
+  } else {
+    contextHeaders = [];
+    for (let h = epochStart; h <= SNAPSHOT.baseHeight; h++) contextHeaders.push(k.codec.decode('BlockHeader', await rpc('getblockheader', await rpc('getblockhash', h), false)));
+  }
+  return { source, rpc, http, epochStart, contextHeaders };
+}
+
+// epoch build: replay from the snapshot and write epochs/<end>.json for every retarget boundary
+// reached, each carrying the set's MuHash at both ends, the hints and the older coins spent.
+// The snapshot's own MuHash is computed once (every coin) and kept beside it.
+async function epochBuild() {
+  const k = await loadEngine(CHAIN.network);
+  if (NO_SCRIPTS) k.blocks.interpreter = null;
+  const utxo = load();
+  const muPath = `${DATA}/muhash-${SNAPSHOT.baseHeight}.json`;
+  let startValue = null;
+  if (existsSync(muPath)) { const m = JSON.parse(readFileSync(muPath, 'utf8')); if (m.sha256 === SNAPSHOT.sha256 && m.coins === utxo.size) { startValue = valueFromHex(m.value); log(`muhash ${m.muhash} at ${m.height} (kept)`); } }
+  if (!startValue) {
+    log(`muhash of the snapshot: ${utxo.size.toLocaleString()} coins`); const t0 = performance.now(); const acc = new MuHash3072(); let n = 0;
+    for (const [txid, coins] of utxo.groups()) for (const [vout, c] of coins) { acc.insert(coinBytes(`${txid}:${vout}`, { output: { value: c.value, scriptPubKey: bytesToHex(c.script) }, height: c.height, coinbase: c.coinbase })); if (++n % 1_000_000 === 0) log(`  ${n.toLocaleString()} coins, ${((performance.now() - t0) / 1000).toFixed(0)} s`); }
+    if (n !== utxo.size) throw new Error(`walked ${n} coins of ${utxo.size}`);
+    startValue = acc.value();
+    writeFileSync(muPath, JSON.stringify({ height: SNAPSHOT.baseHeight, hash: SNAPSHOT.baseHash, coins: n, sha256: SNAPSHOT.sha256, muhash: digestOf(startValue), value: valueHex(startValue) }, null, 1));
+    bench.muhashSnapshot = { coins: n, ms: +(performance.now() - t0).toFixed(0), muhash: digestOf(startValue) };
+    log(`muhash ${digestOf(startValue)} at ${SNAPSHOT.baseHeight}, ${((performance.now() - t0) / 1000).toFixed(0)} s`);
+  }
+  const { source, rpc, http, epochStart, contextHeaders } = await openBlocks(k);
+  const tip = TO ?? await source.tip(); const from = SNAPSHOT.baseHeight + 1;
+  const blocks = []; for (let h = from; h <= tip; h++) blocks[h] = k.codec.decode('Block', await source.blockHex(h));
+  const headers = [...contextHeaders, ...blocks.slice(from, tip + 1).map((b) => b.header)]; // indexed from epochStart
+  const hv = k.headers.validateChain(headers.slice(from - epochStart), { startHeight: from, prevContext: contextHeaders, now: Math.floor(Date.now() / 1000) + 7200 });
+  const bad = hv.filter((v) => !v.ok); if (bad.length) throw new Error(`header ${bad[0].height} failed: ${bad[0].results.filter((r) => r.ok === false).map((r) => r.rule).join(', ')}`);
+  const ctx = runContext({ repo: REPO, schema: SCHEMA });
+  const built = { at: new Date().toISOString(), version: `blaketestnode ${JSON.parse(readFileSync(`${REPO}/package.json`, 'utf8')).version}`, commit: ctx.commit, engine: ctx.engine?.version ?? null, scripts: !NO_SCRIPTS };
+  mkdirSync(`${REPO}/epochs`, { recursive: true });
+  let start = { height: SNAPSHOT.baseHeight, hash: SNAPSHOT.baseHash, coins: utxo.size, value: startValue };
+  let tally = new EpochTally({ startHeight: start.height, startValue });
+  let prev = start.hash; const written = []; const tAll = performance.now();
+  for (let h = from; h <= tip; h++) {
+    const block = blocks[h], hash = hv[h - from].hash;
+    if (block.header.prevBlockHash !== prev) throw new Error(`block ${h} does not link to ${prev}`);
+    const s = k.blocks.validateBlockStructure(block);
+    const c = k.blocks.validateBlockContext(block, { height: h, utxo, mtp: k.headers.medianTimePast(headers.slice(h - 11 - epochStart, h - epochStart)) });
+    if (!s.ok || !c.ok) throw new Error(`block ${h} failed: ${[...s.results, ...c.results].filter((r) => r.ok === false).map((r) => r.rule).join(', ')}`);
+    const missing = tally.block(k, block, h, utxo); if (missing) throw new Error(`block ${h}: no coin for ${missing}`);
+    k.blocks.applyBlock(utxo, block, h); prev = hash;
+    progress.line(blocksLine({ done: h - from + 1, total: tip - from + 1, height: h, ms: performance.now() - tAll }));
+    if (h % CHAIN.retargetInterval === 0) {
+      const hints = tally.hints(utxo); const end = { height: h, hash, coins: utxo.size, value: tally.value() };
+      const pkg = makePackage({ chain: CHAIN.network, alias: CHAIN.alias, start, end, tally, hints, built });
+      const p = `${REPO}/epochs/${h}.json`; writeFileSync(p, packageText(pkg));
+      progress.end(); log(`epoch ${start.height}→${h}: ${tally.blocks} blocks, ${tally.created.length} outputs (${pkg.unspent} unspent at the end), ${tally.spent.length} older coins spent, muhash ${pkg.end.muhash.slice(0, 16)}…, ${(statSync(p).size / 1024).toFixed(0)} KB → ${p}`);
+      written.push({ file: p, start: start.height, end: h, blocks: tally.blocks, outputs: tally.created.length, unspent: pkg.unspent, spent: tally.spent.length, bytes: statSync(p).size });
+      start = end; tally = new EpochTally({ startHeight: h, startValue: end.value });
+    }
+  }
+  progress.end();
+  const value = tally.value();
+  bench.epochs = { written, tip, hash: prev, coins: utxo.size, muhash: digestOf(value), source: http ? 'http' : 'rpc', ms: +(performance.now() - tAll).toFixed(0) };
+  log(`${written.length} epoch package(s) written; the set at ${tip} has ${utxo.size.toLocaleString()} coins, muhash ${bench.epochs.muhash}`);
+  // the running value at the tip against the node's own muhash of its set: without coinstatsindex the node
+  // only answers for its current tip, so the check holds when that is still our tip (about 25 s on 14M coins)
+  if (rpc) {
+    try {
+      const info = await rpc('gettxoutsetinfo', 'muhash');
+      bench.epochs.crosscheck = info.height === tip ? { height: info.height, node: info.muhash, ours: bench.epochs.muhash, match: info.muhash === bench.epochs.muhash } : { note: `node tip moved to ${info.height}, ours is ${tip}` };
+      log(bench.epochs.crosscheck.note ? `no muhash cross-check: ${bench.epochs.crosscheck.note}` : `muhash at ${info.height}: ours vs node → ${bench.epochs.crosscheck.match ? 'MATCH' : 'MISMATCH'}`);
+    } catch (e) { bench.epochs.crosscheck = { note: e.message }; log(`no muhash cross-check: ${e.message}`); }
+  }
+}
+
+// epoch verify <file | end height>: the package against the blocks alone, no snapshot, no set
+async function epochVerify() {
+  const arg = argv[2]; if (!arg || arg.startsWith('--')) throw new Error('epoch verify <file | end height>');
+  const path = existsSync(arg) ? arg : `${REPO}/epochs/${arg}.json`;
+  const pkg = JSON.parse(readFileSync(path, 'utf8'));
+  if (pkg.chain !== CHAIN.network) throw new Error(`package is for ${pkg.chain}, this node follows ${CHAIN.network}`);
+  const k = await loadEngine(CHAIN.network);
+  if (NO_SCRIPTS) k.blocks.interpreter = null;
+  const { source, epochStart, contextHeaders } = await openBlocks(k);
+  const from = pkg.start.height + 1, to = pkg.end.height, tip = await source.tip();
+  if (tip < to) throw new Error(`the block source ends at ${tip}, the package needs ${to}`);
+  const t0 = performance.now();
+  const headers = [...contextHeaders], blocks = [];
+  for (let h = SNAPSHOT.baseHeight + 1; h <= to; h++) { const b = k.codec.decode('Block', await source.blockHex(h)); headers.push(b.header); if (h >= from) blocks[h] = b; }
+  const fetchMs = performance.now() - t0;
+  const r = verifyEpoch(k, pkg, { blocks: (h) => blocks[h], headers, headersFrom: epochStart, log });
+  bench.epoch = { file: path, start: pkg.start.height, end: pkg.end.height, ...r, fetchMs: +fetchMs.toFixed(0), scripts: !NO_SCRIPTS };
+  if (!r.ok) throw new Error(`epoch ${pkg.start.height}→${pkg.end.height} FAILED: ${r.why}`);
+  log(`epoch ${pkg.start.height}→${pkg.end.height} verified: ${r.stats.blocks} blocks, ${r.stats.txs} txs, ${r.stats.created} outputs created (${r.stats.unspent} unspent), ${r.stats.spentOlder} older coins spent, muhash ${pkg.end.muhash.slice(0, 16)}… reached, ${(r.stats.ms / 1000).toFixed(1)} s`);
+}
+
 // status: a running daemon's /status.json as a few lines; --watch [s] keeps it fresh
 async function status() {
   const url = opt('--url', `http://127.0.0.1:${API}/status.json`);
@@ -342,6 +452,7 @@ try {
   else if (cmd === 'verify') load();
   else if (cmd === 'sync') await sync(load());
   else if (cmd === 'bench') { await fetch(); await sync(load()); }
+  else if (cmd === 'epoch') { if (argv[1] === 'build') await epochBuild(); else if (argv[1] === 'verify') await epochVerify(); else throw new Error('epoch build | epoch verify <file | end height>'); }
   else throw new Error(`unknown command ${cmd}`);
   if (bench.blocks && (RECORD || argv.includes('--compare'))) {
     const history = RECORD ?? `${REPO}/bench/history.jsonl`;

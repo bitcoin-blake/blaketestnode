@@ -177,6 +177,33 @@ test/manners-test.mjs` covers it with a fake socket and clock.
 | infohash | `242e9b7dcba15cc0ed8f1bc5f06b68da008f87c0` |
 | webseed | optional, `--webseed <url>` or `BLAKETESTNODE_WEBSEED`; peers and the NIP-35 event carry the rest |
 
+## Epochs
+
+The chain from one retarget boundary to the next as a verifiable unit, after SwiftSync. Each
+`epochs/<end height>.json` carries the MuHash of the UTXO set at both ends (Core's `gettxoutsetinfo
+muhash`, serialised coin for coin the way Core does it), a bitmap saying which of the outputs the epoch
+created are still unspent at its end (the hints), and the data of every older coin the epoch spent (the
+side data). A verifier with the blocks and that file, and no UTXO set at all, validates every block with
+the kernel (the side data plays the set, scripts included), multiplies in every created coin, divides out
+every spent one, and the product must land on the end value. Nothing in the file is trusted: a wrong hint,
+a wrong amount or a missing coin breaks the product, and the test flips each of them to show it.
+
+```
+node --max-old-space-size=8192 bin/blaketestnode.mjs epoch build --source rpc     # from the snapshot to the tip, one file per boundary reached
+node bin/blaketestnode.mjs epoch verify 151200 --data <empty dir> --blocks-url <url>   # the package against the served blocks alone
+```
+
+`build` computes the snapshot's own MuHash once (14.2 M coins, 224 s, kept beside the snapshot as
+`muhash-150307.json`), replays the blocks with full validation, writes a package at every multiple of
+2016, and compares the running value at the tip with the Knots node's `gettxoutsetinfo muhash` when one is
+reachable. On 14 Oct 2026 the two agreed at 152,994: `8767a4541fc5d8a0…`, 14,241,310 coins on both sides.
+
+The first package, `epochs/151200.json` (snapshot 150,307 → 151,200): 893 blocks, 5,826 transactions,
+13,441 outputs created of which 9,251 were still unspent at the end, 5,306 older coins spent, 801 KB,
+nearly all of it the side data. `epoch verify 151200` from an empty directory against melvin.me took
+30 s with scripts on, fetching 6.3 MB of blocks. Post-fork epochs are small enough to sit in the repo;
+the file is JSON-LD (`@type` `Epoch`) so the terms can be defined in the schema once the shape settles.
+
 ## Benchmark (14 Sep 2026, one core of a desktop, Node 24)
 
 | step | result |
@@ -238,4 +265,6 @@ time at every 200th block). `node tools/bench-report.mjs` rewrites the table bel
 - `ops/blaketestnode.config.example.cjs` pm2 example
 - `tools/export-blocks.mjs` keeps the served block file current from a node
 - `lib/engine.mjs`, `lib/rpc.mjs` engine and node RPC loaders
+- `lib/muhash.mjs` MuHash3072 as Core computes it (ChaCha20 keystream, product mod 2^3072 − 1103717), coin serialisation
+- `lib/epoch.mjs`, `epochs/` epoch packages: the tally while blocks apply, the file, the verifier that needs no set
 - `bin/blaketestnode.mjs` the CLI

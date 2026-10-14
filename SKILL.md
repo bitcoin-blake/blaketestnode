@@ -113,6 +113,19 @@ README.md (between `<!-- bench:start -->` and `<!-- bench:end -->`) and draws `b
 On a terminal the long stages show one progress line with the rate and the time left. Compare runs by µs per transaction with scripts on; block counts grow with the chain, so blocks per second
 alone is not a fair comparison across dates.
 
+## Epoch packages (`epoch build`, `epoch verify`)
+
+SwiftSync by retarget epoch. `epoch build --source rpc` replays from the snapshot and writes
+`epochs/<end>.json` at every multiple of 2016: the MuHash of the set at both ends (Core's
+`gettxoutsetinfo muhash`, byte-exact, cross-checked against the node at the tip), a bitmap of which outputs
+the epoch created are unspent at its end, and the older coins it spent with their amounts, scripts and
+heights. `epoch verify <end> --data <empty dir> --blocks-url <url>` proves one from the served blocks with
+no snapshot and no set: the side data plays the set for the kernel's full validation, every created coin
+multiplies in, every spent coin divides out, and the product must reach the end value, the hints must match
+what survived, the side data must all be consumed. The snapshot's own MuHash takes 224 s once and is kept
+as `muhash-150307.json` in the data directory. First package 151200: 801 KB, verified in 30 s with scripts.
+`test/epoch-test.mjs` pins Core's MuHash vectors and breaks a toy package every way the file could lie.
+
 ## Checking it
 
 - `node --test` runs every file in `test/` (zero dependencies beyond webtorrent). `test/webminer-test.mjs`
@@ -130,7 +143,8 @@ alone is not a fair comparison across dates.
 parse the Core format; `lib/packed.mjs`, `lib/delta.mjs`, `lib/state.mjs` are the set, its log and its
 checkpoints; `lib/blockfile.mjs`, `lib/source.mjs`, `lib/nip333.mjs` are where blocks and the tip come
 from; `lib/node.mjs` is the chain state machine; `lib/api.mjs` the routes; `lib/benchlog.mjs` the
-benchmark history; `bin/blaketestnode.mjs` the CLI (`fetch | verify | sync | bench | run | roundtrip`).
+benchmark history; `lib/muhash.mjs`, `lib/epoch.mjs` the MuHash accumulator and the epoch packages in `epochs/`;
+`bin/blaketestnode.mjs` the CLI (`fetch | verify | sync | bench | run | roundtrip | epoch build | epoch verify`).
 The README has the longer account of each part and the measured numbers.
 
 ## Things that bite
