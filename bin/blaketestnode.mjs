@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// blaketestnode: fetch | verify | sync | bench | run | status | epoch build | epoch verify <file|height>   (--watch [s], --url, --compare, --data <dir>, --source http|rpc, --blocks-url <url>, --webseed <url>, --conf <bitcoin.conf>, --no-scripts, --to <height>, --api <port>, --poll <s>, --checkpoint-every <n>, --address-index, --pair-api <url>, --record [history.jsonl])
+// blaketestnode: fetch | verify | sync | bench | run | status | epoch build [--open] | epoch verify <file|height>   (--watch [s], --url, --compare, --data <dir>, --source http|rpc, --blocks-url <url>, --webseed <url>, --conf <bitcoin.conf>, --no-scripts, --to <height>, --api <port>, --poll <s>, --checkpoint-every <n>, --address-index, --pair-api <url>, --record [history.jsonl])
 import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, statSync } from 'node:fs';
 import { bytesToHex } from '../lib/bytes.mjs';
 import { MuHash3072, coinBytes, valueHex, valueFromHex, digestOf } from '../lib/muhash.mjs';
@@ -37,6 +37,7 @@ const DATA = opt('--data', `${homedir()}/.blaketestnode/${CHAIN.alias}`).replace
 const CONF = opt('--conf', CHAIN.conf);
 const NO_SCRIPTS = argv.includes('--no-scripts');
 const TO = opt('--to') ? Number(opt('--to')) : null;
+const OPEN = argv.includes('--open'); // epoch build: also write epochs/current.json, the open epoch from the last boundary to the tip
 const SOURCE = opt('--source', 'http'); // http: a served block file + NIP-333 tip; rpc: the local node
 if (opt('--blocks-url')) CHAIN.blocksUrl = opt('--blocks-url');
 if (opt('--webseed')) SNAPSHOT.webseed = opt('--webseed');
@@ -390,14 +391,22 @@ async function epochBuild() {
     if (h % CHAIN.retargetInterval === 0) {
       const hints = tally.hints(utxo); const end = { height: h, hash, coins: utxo.size, value: tally.value() };
       const pkg = makePackage({ chain: CHAIN.network, alias: CHAIN.alias, start, end, tally, hints, built });
-      const p = `${REPO}/epochs/${h}.json`; writeFileSync(p, packageText(pkg));
-      progress.end(); log(`epoch ${start.height}→${h}: ${tally.blocks} blocks, ${tally.created.length} outputs (${pkg.unspent} unspent at the end), ${tally.spent.length} older coins spent, muhash ${pkg.end.muhash.slice(0, 16)}…, ${(statSync(p).size / 1024).toFixed(0)} KB → ${p}`);
+      const p = `${REPO}/epochs/${h}.json`; const kept = existsSync(p); if (!kept) writeFileSync(p, packageText(pkg)); // a sealed package is never rewritten: only its build stamp could change
+      progress.end(); log(`epoch ${start.height}→${h}: ${tally.blocks} blocks, ${tally.created.length} outputs (${pkg.unspent} unspent at the end), ${tally.spent.length} older coins spent, muhash ${pkg.end.muhash.slice(0, 16)}…, ${(statSync(p).size / 1024).toFixed(0)} KB → ${p}${kept ? ' (kept)' : ''}`);
       written.push({ file: p, start: start.height, end: h, blocks: tally.blocks, outputs: tally.created.length, unspent: pkg.unspent, spent: tally.spent.length, bytes: statSync(p).size });
       start = end; tally = new EpochTally({ startHeight: h, startValue: end.value });
     }
   }
   progress.end();
   const value = tally.value();
+  if (OPEN && tally.blocks) {
+    // the open epoch: the same package up to the tip, hints provisional, so a client can verify the tail today
+    const hints = tally.hints(utxo); const end = { height: tip, hash: prev, coins: utxo.size, value };
+    const pkg = { ...makePackage({ chain: CHAIN.network, alias: CHAIN.alias, start, end, tally, hints, built }), sealed: false, boundary: start.height + CHAIN.retargetInterval };
+    const p = `${REPO}/epochs/current.json`; writeFileSync(p, packageText(pkg));
+    log(`open epoch ${start.height}→${tip} (seals at ${pkg.boundary}): ${tally.blocks} blocks, ${tally.created.length} outputs (${pkg.unspent} unspent now), ${tally.spent.length} older coins spent, muhash ${pkg.end.muhash.slice(0, 16)}…, ${(statSync(p).size / 1024).toFixed(0)} KB → ${p}`);
+    bench.open = { file: p, start: start.height, tip, boundary: pkg.boundary, blocks: tally.blocks, bytes: statSync(p).size };
+  }
   bench.epochs = { written, tip, hash: prev, coins: utxo.size, muhash: digestOf(value), source: http ? 'http' : 'rpc', ms: +(performance.now() - tAll).toFixed(0) };
   log(`${written.length} epoch package(s) written; the set at ${tip} has ${utxo.size.toLocaleString()} coins, muhash ${bench.epochs.muhash}`);
   // the running value at the tip against the node's own muhash of its set: without coinstatsindex the node

@@ -191,6 +191,7 @@ a wrong amount or a missing coin breaks the product, and the test flips each of 
 ```
 node --max-old-space-size=8192 bin/blaketestnode.mjs epoch build --source rpc     # from the snapshot to the tip, one file per boundary reached
 node bin/blaketestnode.mjs epoch verify 151200 --data <empty dir> --blocks-url <url>   # the package against the served blocks alone
+node --max-old-space-size=8192 bin/blaketestnode.mjs epoch build --source rpc --open   # also epochs/current.json: the open epoch to the tip, hints provisional, sealed: false
 ```
 
 `build` computes the snapshot's own MuHash once (14.2 M coins, 224 s, kept beside the snapshot as
@@ -203,6 +204,11 @@ The first package, `epochs/151200.json` (snapshot 150,307 → 151,200): 893 bloc
 nearly all of it the side data. `epoch verify 151200` from an empty directory against melvin.me took
 30 s with scripts on, fetching 6.3 MB of blocks. Post-fork epochs are small enough to sit in the repo;
 the file is JSON-LD (`@type` `Epoch`) so the terms can be defined in the schema once the shape settles.
+
+Sealed packages live at [bitcoin-blake/epochs](https://bitcoin-blake.github.io/epochs/) with their torrents. The open epoch,
+`epochs/current.json` (`sealed: false`, `boundary` = the height it seals at), is rebuilt every four hours by
+`ops/publish-current.sh` (pm2 `epoch-current-txbt4`, `ops/epoch-current.config.cjs`) and put on R2 at
+https://pub-8cae8bad22cf4f44b22188af9b1c0064.r2.dev/epochs/txbt4-current.json. `epoch verify` takes it like any package.
 
 ## Benchmark (14 Sep 2026, one core of a desktop, Node 24)
 
