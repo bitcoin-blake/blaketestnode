@@ -3,7 +3,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, statSync } from 'node:fs';
 import { bytesToHex } from '../lib/bytes.mjs';
 import { MuHash3072, coinBytes, valueHex, valueFromHex, digestOf } from '../lib/muhash.mjs';
-import { EpochTally, makePackage, packageText, verifyEpoch } from '../lib/epoch.mjs';
+import { EpochTally, makePackage, packageText, verifyEpoch, isEpochEnd, nextEpochEnd } from '../lib/epoch.mjs';
 import { homedir } from 'node:os';
 import { CHAIN, SNAPSHOT } from '../lib/params.mjs';
 import { writeSnapshot } from '../lib/snapshot-write.mjs';
@@ -348,7 +348,7 @@ async function openBlocks(k) {
   return { source, rpc, http, epochStart, contextHeaders };
 }
 
-// epoch build: replay from the snapshot and write epochs/<end>.json for every retarget boundary
+// epoch build: replay from the snapshot and write epochs/<end>.json at the last block of every retarget period
 // reached, each carrying the set's MuHash at both ends, the hints and the older coins spent.
 // The snapshot's own MuHash is computed once (every coin) and kept beside it.
 async function epochBuild() {
@@ -388,7 +388,7 @@ async function epochBuild() {
     const missing = tally.block(k, block, h, utxo); if (missing) throw new Error(`block ${h}: no coin for ${missing}`);
     k.blocks.applyBlock(utxo, block, h); prev = hash;
     progress.line(blocksLine({ done: h - from + 1, total: tip - from + 1, height: h, ms: performance.now() - tAll }));
-    if (h % CHAIN.retargetInterval === 0) {
+    if (isEpochEnd(h, CHAIN.retargetInterval)) {
       const hints = tally.hints(utxo); const end = { height: h, hash, coins: utxo.size, value: tally.value() };
       const pkg = makePackage({ chain: CHAIN.network, alias: CHAIN.alias, start, end, tally, hints, built });
       const p = `${REPO}/epochs/${h}.json`; const kept = existsSync(p); if (!kept) writeFileSync(p, packageText(pkg)); // a sealed package is never rewritten: only its build stamp could change
@@ -402,7 +402,7 @@ async function epochBuild() {
   if (OPEN && tally.blocks) {
     // the open epoch: the same package up to the tip, hints provisional, so a client can verify the tail today
     const hints = tally.hints(utxo); const end = { height: tip, hash: prev, coins: utxo.size, value };
-    const pkg = { ...makePackage({ chain: CHAIN.network, alias: CHAIN.alias, start, end, tally, hints, built }), sealed: false, boundary: start.height + CHAIN.retargetInterval };
+    const pkg = { ...makePackage({ chain: CHAIN.network, alias: CHAIN.alias, start, end, tally, hints, built }), sealed: false, boundary: nextEpochEnd(start.height, CHAIN.retargetInterval) };
     const p = `${REPO}/epochs/current.json`; writeFileSync(p, packageText(pkg));
     log(`open epoch ${start.height}→${tip} (seals at ${pkg.boundary}): ${tally.blocks} blocks, ${tally.created.length} outputs (${pkg.unspent} unspent now), ${tally.spent.length} older coins spent, muhash ${pkg.end.muhash.slice(0, 16)}…, ${(statSync(p).size / 1024).toFixed(0)} KB → ${p}`);
     bench.open = { file: p, start: start.height, tip, boundary: pkg.boundary, blocks: tally.blocks, bytes: statSync(p).size };

@@ -2,7 +2,7 @@
 // (lib/epoch.mjs) built from a toy chain, verified, then broken in each way the file could lie.
 import { createCipheriv, randomBytes } from 'node:crypto';
 import { MuHash3072, chacha20Keystream, coinBytes, valueHex, digestOf } from '../lib/muhash.mjs';
-import { EpochTally, makePackage, packageText, verifyEpoch, bitsToBytes, bytesToBits, toBase64, fromBase64 } from '../lib/epoch.mjs';
+import { EpochTally, makePackage, packageText, verifyEpoch, bitsToBytes, bytesToBits, toBase64, fromBase64, isEpochEnd, nextEpochEnd } from '../lib/epoch.mjs';
 let pass = 0, fail = 0; const t = (name, ok, d = '') => { console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name}${ok || !d ? '' : `\n        ${d}`}`); ok ? pass++ : fail++; };
 
 // ---- MuHash ----
@@ -69,4 +69,10 @@ r = mutate((p) => { p.end.coins = 5; });
 t('a wrong coin count is caught', !r.ok && /coin count/.test(r.why), r.why);
 r = mutate((p) => { p.end.value = valueHex(startValue); p.end.muhash = digestOf(startValue); });
 t('a wrong end value is caught', !r.ok && /does not reach the end value/.test(r.why), r.why);
+// boundaries: an epoch is Core's retarget period [2016n, 2016n+2015]; Core retargets where height % 2016 == 0
+t('a period ends at 2015, 4031, 151199, not at a multiple of 2016', [2015, 4031, 151199].every((h) => isEpochEnd(h, 2016)) && ![0, 2016, 4032, 151200].some((h) => isEpochEnd(h, 2016)));
+t('from genesis the first package seals at 2015', nextEpochEnd(0, 2016) === 2015);
+t('from a period end the next package seals one period on', nextEpochEnd(2015, 2016) === 4031 && nextEpochEnd(4031, 2016) === 6047);
+t('from a snapshot inside a period (txbt4 150307) the package seals at that period\'s end', nextEpochEnd(150307, 2016) === 151199);
+t('from the block just before a period end, that end', nextEpochEnd(2014, 2016) === 2015);
 console.log(`\n${pass} passed, ${fail} failed`); process.exit(fail ? 1 : 0);
